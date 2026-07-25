@@ -33,6 +33,7 @@
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -58,42 +59,75 @@
 #define PATH_MAX 4096
 #endif
 
-#define I3SHOT_VERSION "1.1.0"
+#define I3SHOT_VERSION "1.2.0"
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define I3SHOT_MAX_PIXELS UINT64_C(100000000)
+#define I3SHOT_MAX_WORK_BYTES (UINT64_C(1024) * 1024 * 1024)
+#define I3SHOT_MAX_DELAY 86400.0
+#define I3SHOT_IPC_TIMEOUT_MS INT64_C(3000)
+#define I3SHOT_MAX_JSON_DEPTH 256
+#define I3SHOT_MAX_JSON_TOKENS 1000000u
 #define MIN2(a,b) ((a) < (b) ? (a) : (b))
 #define MAX2(a,b) ((a) > (b) ? (a) : (b))
 #define CLAMP(v,lo,hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 
 static volatile sig_atomic_t g_interrupted = 0;
+static volatile sig_atomic_t g_signal = 0;
 static int g_xerror = 0;
 static int g_sigpipe[2] = { -1, -1 };            /* self-pipe for signal wakeups */
 
 static void on_signal(int sig) {
-    (void)sig;
+    int saved_errno = errno;
     g_interrupted = 1;
-    if (g_sigpipe[1] >= 0) { char c = 1; ssize_t r = write(g_sigpipe[1], &c, 1); (void)r; }
+    g_signal = sig;
+    if (g_sigpipe[1] >= 0) {
+        const unsigned char c = 1;
+        ssize_t r = write(g_sigpipe[1], &c, 1);
+        (void)r;
+    }
+    errno = saved_errno;
 }
 
-/* Install interruptible handlers (no SA_RESTART) plus a self-pipe so blocking
-   waits on X11 or IPC can be woken by SIGINT/SIGTERM. */
+/* Install interruptible handlers (no SA_RESTART) plus a nonblocking self-pipe
+   so blocking waits on X11 or IPC can be woken by SIGINT/SIGTERM. */
 static void install_signals(void) {
-    if (pipe(g_sigpipe) == 0) {
-        for (int i = 0; i < 2; ++i) {
-            int fl = fcntl(g_sigpipe[i], F_GETFL, 0);
-            if (fl >= 0) fcntl(g_sigpipe[i], F_SETFL, fl | O_NONBLOCK);
-            fl = fcntl(g_sigpipe[i], F_GETFD, 0);
-            if (fl >= 0) fcntl(g_sigpipe[i], F_SETFD, fl | FD_CLOEXEC);
+#ifdef __linux__
+    if (pipe2(g_sigpipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+        perror("i3shot: pipe2");
+        exit(EXIT_FAILURE);
+    }
+#else
+    if (pipe(g_sigpipe) < 0) {
+        perror("i3shot: pipe");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < 2; ++i) {
+        int fl = fcntl(g_sigpipe[i], F_GETFL, 0);
+        if (fl < 0 || fcntl(g_sigpipe[i], F_SETFL, fl | O_NONBLOCK) < 0) {
+            perror("i3shot: fcntl(O_NONBLOCK)");
+            exit(EXIT_FAILURE);
+        }
+        fl = fcntl(g_sigpipe[i], F_GETFD, 0);
+        if (fl < 0 || fcntl(g_sigpipe[i], F_SETFD, fl | FD_CLOEXEC) < 0) {
+            perror("i3shot: fcntl(FD_CLOEXEC)");
+            exit(EXIT_FAILURE);
         }
     }
+#endif
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;                    /* no SA_RESTART: syscalls return EINTR */
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0) {
+        perror("i3shot: sigaction");
+        exit(EXIT_FAILURE);
+    }
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_IGN;
-    sigaction(SIGPIPE, &sa, NULL);
+    if (sigaction(SIGPIPE, &sa, NULL) < 0) {
+        perror("i3shot: sigaction(SIGPIPE)");
+        exit(EXIT_FAILURE);
+    }
 }
 
 static int xerror_handler(Display *d, XErrorEvent *e) {
@@ -148,6 +182,37 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
+static bool checked_add_size(size_t a, size_t b, size_t *out) {
+    if (a > SIZE_MAX - b) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool checked_mul_size(size_t a, size_t b, size_t *out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static size_t checked_image_bytes(int w, int h, size_t bytes_per_pixel, const char *what) {
+    if (w <= 0 || h <= 0) die("invalid %s size %dx%d", what, w, h);
+    uint64_t pixels64 = (uint64_t)(unsigned)w * (uint64_t)(unsigned)h;
+    if (pixels64 > I3SHOT_MAX_PIXELS)
+        die("%s is too large (%llu pixels; limit is %llu)", what,
+            (unsigned long long)pixels64, (unsigned long long)I3SHOT_MAX_PIXELS);
+    size_t pixels = (size_t)pixels64, bytes = 0;
+    if (!checked_mul_size(pixels, bytes_per_pixel, &bytes))
+        die("%s allocation size overflow", what);
+    return bytes;
+}
+
+static void ensure_work_budget(uint64_t bytes, const char *what) {
+    if (bytes > I3SHOT_MAX_WORK_BYTES)
+        die("%s would require about %llu MiB of working memory; limit is %llu MiB", what,
+            (unsigned long long)((bytes + 1024 * 1024 - 1) / (1024 * 1024)),
+            (unsigned long long)(I3SHOT_MAX_WORK_BYTES / (1024 * 1024)));
+}
+
 static bool write_all_fd(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     while (len) {
@@ -174,16 +239,17 @@ static void sleep_seconds(double sec) {
 
 /* -------------------------- strict numeric parsing ------------------------ */
 
-/* Parse a base-10/0x integer, requiring the whole string to be consumed and
-   the value to fit in [lo,hi]. Returns false on any garbage or overflow. */
+/* Parse a decimal integer, requiring the whole string to be consumed and the
+   value to fit in [lo,hi]. Leading zeroes remain decimal, never octal. */
 static bool parse_long_strict(const char *s, long lo, long hi, long *out) {
     if (!s || !*s) return false;
     while (isspace((unsigned char)*s)) ++s;
     char *end = NULL;
     errno = 0;
-    long v = strtol(s, &end, 0);
-    if (errno || end == s || *end) return false;
-    if (v < lo || v > hi) return false;
+    long v = strtol(s, &end, 10);
+    if (errno || end == s) return false;
+    while (isspace((unsigned char)*end)) ++end;
+    if (*end || v < lo || v > hi) return false;
     *out = v;
     return true;
 }
@@ -195,28 +261,33 @@ static bool parse_int_strict(const char *s, int lo, int hi, int *out) {
     return true;
 }
 
-/* Parse an unsigned value with no sign allowed, whole string consumed. */
+/* Parse an unsigned ID. Decimal is the default; 0x/0X explicitly selects hex. */
 static bool parse_ulong_strict(const char *s, unsigned long max, unsigned long *out) {
     if (!s || !*s) return false;
     const char *p = s;
     while (isspace((unsigned char)*p)) ++p;
-    if (*p == '-' || *p == '+') return false;      /* reject signs for IDs */
+    if (*p == '-' || *p == '+') return false;
+    int base = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ? 16 : 10;
     char *end = NULL;
     errno = 0;
-    unsigned long v = strtoul(p, &end, 0);
-    if (errno || end == p || *end || v > max) return false;
+    unsigned long v = strtoul(p, &end, base);
+    if (errno || end == p) return false;
+    while (isspace((unsigned char)*end)) ++end;
+    if (*end || v > max) return false;
     *out = v;
     return true;
 }
 
-/* Parse a finite, non-negative double (rejects NaN/Inf and trailing garbage). */
+/* Parse a finite screenshot delay with a practical, conversion-safe limit. */
 static bool parse_double_strict(const char *s, double *out) {
     if (!s || !*s) return false;
     while (isspace((unsigned char)*s)) ++s;
     char *end = NULL;
     errno = 0;
     double v = strtod(s, &end);
-    if (end == s || *end || !isfinite(v)) return false;
+    if (errno || end == s || !isfinite(v)) return false;
+    while (isspace((unsigned char)*end)) ++end;
+    if (*end || v < 0.0 || v > I3SHOT_MAX_DELAY) return false;
     *out = v;
     return true;
 }
@@ -262,9 +333,8 @@ static Rect rect_intersect(Rect a, Rect b) {
 }
 
 static Image image_new(int w, int h) {
-    if (w <= 0 || h <= 0) die("invalid image size %dx%d", w, h);
-    if ((size_t)w > SIZE_MAX / 3u / (size_t)h) die("image is too large");
-    Image im = { w, h, xcalloc((size_t)w * (size_t)h, 3) };
+    size_t bytes = checked_image_bytes(w, h, 3, "image");
+    Image im = { w, h, xcalloc(bytes, 1) };
     return im;
 }
 
@@ -328,9 +398,16 @@ static void image_blur_rect(Image *im, Rect r, int radius) {
     r = rect_intersect(r, (Rect){0, 0, im->w, im->h});
     radius = CLAMP(radius, 1, 30);
     if (!rect_valid(r)) return;
-    size_t stride = (size_t)(r.w + 1);
-    size_t cells = stride * (size_t)(r.h + 1);
-    uint64_t *sum = xcalloc(cells * 3, sizeof(uint64_t));
+    size_t stride = 0, cells = 0, planes = 0, sum_bytes = 0, tmp_bytes = 0;
+    if (!checked_add_size((size_t)r.w, 1, &stride) ||
+        !checked_mul_size(stride, (size_t)r.h + 1, &cells) ||
+        !checked_mul_size(cells, 3, &planes) ||
+        !checked_mul_size(planes, sizeof(uint64_t), &sum_bytes) ||
+        !checked_mul_size((size_t)r.w, (size_t)r.h, &tmp_bytes) ||
+        !checked_mul_size(tmp_bytes, 3, &tmp_bytes))
+        die("blur working-memory size overflow");
+    ensure_work_budget((uint64_t)sum_bytes + tmp_bytes, "blur");
+    uint64_t *sum = xcalloc(planes, sizeof(uint64_t));
     for (int y = 1; y <= r.h; ++y) {
         uint64_t rows[3] = {0,0,0};
         for (int x = 1; x <= r.w; ++x) {
@@ -341,7 +418,7 @@ static void image_blur_rect(Image *im, Rect r, int radius) {
             }
         }
     }
-    uint8_t *tmp = xmalloc((size_t)r.w * r.h * 3);
+    uint8_t *tmp = xmalloc(tmp_bytes);
     for (int y = 0; y < r.h; ++y) {
         int y0 = MAX2(0, y - radius), y1 = MIN2(r.h - 1, y + radius);
         for (int x = 0; x < r.w; ++x) {
@@ -381,6 +458,8 @@ static void buf_reserve(Buf *b, size_t add) {
 }
 
 static void buf_put(Buf *b, const void *p, size_t n) {
+    if (n == 0) return;
+    if (!p) die("internal error: NULL buffer source");
     buf_reserve(b, n);
     memcpy(b->p + b->n, p, n);
     b->n += n;
@@ -565,9 +644,13 @@ static uint8_t paeth(uint8_t a, uint8_t b, uint8_t c) {
 }
 
 static Buf png_filter_rows(const Image *im, int level) {
-    size_t row = (size_t)im->w * 3;
+    size_t row = 0, raw_size = 0, row_plus = 0;
+    if (!checked_mul_size((size_t)im->w, 3, &row) ||
+        !checked_add_size(row, 1, &row_plus) ||
+        !checked_mul_size(row_plus, (size_t)im->h, &raw_size))
+        die("PNG raw-image size overflow");
     Buf raw = {0};
-    buf_reserve(&raw, (row + 1) * (size_t)im->h);
+    buf_reserve(&raw, raw_size);
     uint8_t *tmp[5];
     for (int f = 0; f < 5; ++f) tmp[f] = xmalloc(row);
     for (int y = 0; y < im->h; ++y) {
@@ -595,6 +678,9 @@ static Buf png_filter_rows(const Image *im, int level) {
 }
 
 static Buf encode_png(const Image *im, int level) {
+    uint64_t rgb = (uint64_t)(unsigned)im->w * (uint64_t)(unsigned)im->h * 3u;
+    uint64_t row_scratch = (uint64_t)(unsigned)im->w * 3u * 5u;
+    ensure_work_budget(rgb * 4u + row_scratch + (uint64_t)(unsigned)im->h, "PNG encoding");
     Buf out = {0};
     static const uint8_t sig[8] = {137,80,78,71,13,10,26,10};
     buf_put(&out, sig, sizeof(sig));
@@ -615,9 +701,13 @@ static Buf encode_png(const Image *im, int level) {
 }
 
 static Buf encode_bmp(const Image *im) {
-    size_t row = ((size_t)im->w * 3 + 3) & ~(size_t)3;
-    size_t pix = row * (size_t)im->h;
-    if (pix > UINT32_MAX - 54) die("BMP is too large");
+    size_t raw_row = 0, row = 0, pix = 0;
+    if (!checked_mul_size((size_t)im->w, 3, &raw_row) || raw_row > SIZE_MAX - 3)
+        die("BMP row size overflow");
+    row = (raw_row + 3) & ~(size_t)3;
+    if (!checked_mul_size(row, (size_t)im->h, &pix) || pix > UINT32_MAX - 54)
+        die("BMP is too large");
+    ensure_work_budget((uint64_t)pix + (uint64_t)(unsigned)im->w * (uint64_t)(unsigned)im->h * 3u, "BMP encoding");
     Buf b = {0}; buf_reserve(&b, 54 + pix);
     uint8_t hdr[54] = {0};
     hdr[0]='B'; hdr[1]='M';
@@ -669,13 +759,21 @@ typedef struct {
 
 typedef Bool (*ShapeQueryFn)(Display *, int *, int *);
 typedef void (*ShapeRectsFn)(Display *, Window, int, int, int, XRectangle *, int, int, int);
+typedef Bool (*DynQueryExtensionFn)(Display *, int *, int *);
+typedef Status (*DynQueryVersionFn)(Display *, int *, int *);
 
 typedef struct {
     void *fixes, *randr, *composite, *xshape;
     DynXFixesCursorImage *(*XFixesGetCursorImage)(Display *);
+    DynQueryExtensionFn XFixesQueryExtension;
+    DynQueryVersionFn XFixesQueryVersion;
     DynXRRMonitorInfo *(*XRRGetMonitors)(Display *, Window, Bool, int *);
     void (*XRRFreeMonitors)(DynXRRMonitorInfo *);
+    DynQueryExtensionFn XRRQueryExtension;
+    DynQueryVersionFn XRRQueryVersion;
     Pixmap (*XCompositeNameWindowPixmap)(Display *, Window);
+    DynQueryExtensionFn XCompositeQueryExtension;
+    DynQueryVersionFn XCompositeQueryVersion;
     ShapeQueryFn XShapeQueryExtension;   /* libXext: SHAPE presence */
     ShapeRectsFn XShapeCombineRectangles;/* libXext: shape a window */
 } XExt;
@@ -692,12 +790,22 @@ static void xext_load(XExt *e) {
     const char *comp[]={"libXcomposite.so.1","libXcomposite.so",NULL};
     const char *shape[]={"libXext.so.6","libXext.so",NULL};
     e->fixes=dlopen_any(fixes); e->randr=dlopen_any(randr); e->composite=dlopen_any(comp); e->xshape=dlopen_any(shape);
-    if(e->fixes) *(void **)(&e->XFixesGetCursorImage)=dlsym(e->fixes,"XFixesGetCursorImage");
+    if(e->fixes) {
+        *(void **)(&e->XFixesGetCursorImage)=dlsym(e->fixes,"XFixesGetCursorImage");
+        *(void **)(&e->XFixesQueryExtension)=dlsym(e->fixes,"XFixesQueryExtension");
+        *(void **)(&e->XFixesQueryVersion)=dlsym(e->fixes,"XFixesQueryVersion");
+    }
     if(e->randr) {
         *(void **)(&e->XRRGetMonitors)=dlsym(e->randr,"XRRGetMonitors");
         *(void **)(&e->XRRFreeMonitors)=dlsym(e->randr,"XRRFreeMonitors");
+        *(void **)(&e->XRRQueryExtension)=dlsym(e->randr,"XRRQueryExtension");
+        *(void **)(&e->XRRQueryVersion)=dlsym(e->randr,"XRRQueryVersion");
     }
-    if(e->composite) *(void **)(&e->XCompositeNameWindowPixmap)=dlsym(e->composite,"XCompositeNameWindowPixmap");
+    if(e->composite) {
+        *(void **)(&e->XCompositeNameWindowPixmap)=dlsym(e->composite,"XCompositeNameWindowPixmap");
+        *(void **)(&e->XCompositeQueryExtension)=dlsym(e->composite,"XCompositeQueryExtension");
+        *(void **)(&e->XCompositeQueryVersion)=dlsym(e->composite,"XCompositeQueryVersion");
+    }
     if(e->xshape) {
         *(void **)(&e->XShapeQueryExtension)=dlsym(e->xshape,"XShapeQueryExtension");
         *(void **)(&e->XShapeCombineRectangles)=dlsym(e->xshape,"XShapeCombineRectangles");
@@ -719,45 +827,107 @@ typedef struct {
     int screen;
     Window root;
     int root_w, root_h;
+    bool display_explicit;
+    bool fixes_ok, randr_ok, composite_ok, shape_ok;
     XExt ext;
 } XCtx;
 
 static Atom atom(Display *d, const char *name) { return XInternAtom(d,name,False); }
 
-static bool get_property(Display *d, Window w, Atom prop, Atom req_type,
-                         unsigned char **data, unsigned long *nitems, Atom *actual_type, int *actual_format) {
-    unsigned long after=0;
-    /* 16 MiB worth of 32-bit units is far more than any property we read. */
-    int st=XGetWindowProperty(d,w,prop,0,4L*1024*1024,False,req_type,actual_type,actual_format,nitems,&after,data);
-    return st==Success && *data!=NULL;
+static void xerror_begin(Display *d) {
+    XSync(d, False);                                /* flush unrelated old errors first */
+    g_xerror = 0;
+}
+
+static int xerror_end(Display *d) {
+    XSync(d, False);
+    return g_xerror;
+}
+
+static bool refresh_root_geometry(XCtx *x) {
+    XWindowAttributes a;
+    if (!XGetWindowAttributes(x->dpy, x->root, &a) || a.width <= 0 || a.height <= 0)
+        return false;
+    x->root_w = a.width;
+    x->root_h = a.height;
+    return true;
+}
+
+static bool compositor_active(XCtx *x) {
+    char name[64];
+    snprintf(name, sizeof(name), "_NET_WM_CM_S%d", x->screen);
+    return XGetSelectionOwner(x->dpy, atom(x->dpy, name)) != None;
+}
+
+static void xext_probe(XCtx *x) {
+    int eb = 0, er = 0, major = 5, minor = 0;
+    x->fixes_ok = x->ext.XFixesGetCursorImage && x->ext.XFixesQueryExtension &&
+                  x->ext.XFixesQueryVersion && x->ext.XFixesQueryExtension(x->dpy, &eb, &er) &&
+                  x->ext.XFixesQueryVersion(x->dpy, &major, &minor);
+    major = 1; minor = 5;
+    x->randr_ok = x->ext.XRRGetMonitors && x->ext.XRRFreeMonitors &&
+                  x->ext.XRRQueryExtension && x->ext.XRRQueryVersion &&
+                  x->ext.XRRQueryExtension(x->dpy, &eb, &er) &&
+                  x->ext.XRRQueryVersion(x->dpy, &major, &minor) &&
+                  (major > 1 || (major == 1 && minor >= 5));
+    major = 0; minor = 4;
+    x->composite_ok = x->ext.XCompositeNameWindowPixmap &&
+                      x->ext.XCompositeQueryExtension && x->ext.XCompositeQueryVersion &&
+                      x->ext.XCompositeQueryExtension(x->dpy, &eb, &er) &&
+                      x->ext.XCompositeQueryVersion(x->dpy, &major, &minor);
+    x->shape_ok = x->ext.XShapeQueryExtension && x->ext.XShapeCombineRectangles &&
+                  x->ext.XShapeQueryExtension(x->dpy, &eb, &er);
+}
+
+static bool get_property_limited(Display *d, Window w, Atom prop, Atom req_type,
+                                 unsigned long max_items, unsigned char **data,
+                                 unsigned long *nitems, Atom *actual_type, int *actual_format) {
+    unsigned long after = 0;
+    *data = NULL; *nitems = 0;
+    int st = XGetWindowProperty(d, w, prop, 0, (long)max_items, False, req_type,
+                                actual_type, actual_format, nitems, &after, data);
+    if (st != Success || !*data) return false;
+    if (after != 0) { XFree(*data); *data = NULL; *nitems = 0; return false; }
+    return true;
 }
 
 static char *get_text_property_utf8(Display *d, Window w, const char *propname) {
     Atom actual; int fmt; unsigned long n=0; unsigned char *data=NULL;
     Atom utf8=atom(d,"UTF8_STRING");
-    if(get_property(d,w,atom(d,propname),utf8,&data,&n,&actual,&fmt) && fmt==8) {
+    if(get_property_limited(d,w,atom(d,propname),utf8,262144,&data,&n,&actual,&fmt) && fmt==8) {
         char *s=xmalloc(n+1); memcpy(s,data,n); s[n]='\0'; XFree(data); return s;
     }
     if(data) XFree(data);
     XTextProperty tp;
     if (XGetWMName(d, w, &tp) && tp.value) {
+        char **list = NULL; int count = 0;
+        if (Xutf8TextPropertyToTextList(d, &tp, &list, &count) >= Success && list && count > 0) {
+            char *s = xstrdup(list[0]); XFreeStringList(list); XFree(tp.value); return s;
+        }
+        if (list) XFreeStringList(list);
         char *s = xmalloc((size_t)tp.nitems + 1);
-        memcpy(s, tp.value, tp.nitems);
-        s[tp.nitems] = '\0';
-        XFree(tp.value);
-        return s;
+        memcpy(s, tp.value, tp.nitems); s[tp.nitems] = '\0'; XFree(tp.value); return s;
     }
     return xstrdup("");
+}
+
+static bool window_is_capture_candidate(XCtx *x, Window w) {
+    if (w == None || w == PointerRoot || w == x->root) return false;
+    XWindowAttributes a;
+    return XGetWindowAttributes(x->dpy, w, &a) && a.class == InputOutput &&
+           a.map_state != IsUnmapped && a.width > 0 && a.height > 0;
 }
 
 static Window get_active_window(XCtx *x) {
     unsigned char *data=NULL; unsigned long n=0; Atom actual; int fmt;
     Window w=None;
-    if(get_property(x->dpy,x->root,atom(x->dpy,"_NET_ACTIVE_WINDOW"),XA_WINDOW,&data,&n,&actual,&fmt) && n>=1 && fmt==32)
+    if(get_property_limited(x->dpy,x->root,atom(x->dpy,"_NET_ACTIVE_WINDOW"),XA_WINDOW,1,&data,&n,&actual,&fmt) && n>=1 && fmt==32)
         w=*(Window*)data;
     if(data) XFree(data);
-    if(w!=None) return w;                          /* honor EWMH only when meaningful */
-    Window focus=None; int revert=0; XGetInputFocus(x->dpy,&focus,&revert); return focus;
+    if(window_is_capture_candidate(x, w)) return w;
+    Window focus=None; int revert=0;
+    XGetInputFocus(x->dpy,&focus,&revert);
+    return window_is_capture_candidate(x, focus) ? focus : None;
 }
 
 static bool window_absolute_rect(XCtx *x, Window w, bool border, Rect *out) {
@@ -768,12 +938,14 @@ static bool window_absolute_rect(XCtx *x, Window w, bool border, Rect *out) {
     Rect r={rx,ry,a.width,a.height};
     if(border) {
         unsigned char *data=NULL; unsigned long n=0; Atom actual; int fmt;
-        if(get_property(x->dpy,w,atom(x->dpy,"_NET_FRAME_EXTENTS"),XA_CARDINAL,&data,&n,&actual,&fmt) && n>=4 && fmt==32) {
+        if(get_property_limited(x->dpy,w,atom(x->dpy,"_NET_FRAME_EXTENTS"),XA_CARDINAL,4,&data,&n,&actual,&fmt) && n>=4 && fmt==32) {
             unsigned long *v=(unsigned long*)data;
             long l=(long)v[0],rr=(long)v[1],t=(long)v[2],b=(long)v[3];
             const long CAP=100000;                 /* reject absurd extents */
             if(l>=0&&l<=CAP&&rr>=0&&rr<=CAP&&t>=0&&t<=CAP&&b>=0&&b<=CAP){
-                r.x-=(int)l; r.w+=(int)(l+rr); r.y-=(int)t; r.h+=(int)(t+b);
+                int64_t nx=(int64_t)r.x-l, ny=(int64_t)r.y-t;
+                int64_t nw=(int64_t)r.w+l+rr, nh=(int64_t)r.h+t+b;
+                r=(Rect){clamp_i64_to_int(nx),clamp_i64_to_int(ny),clamp_i64_to_int(nw),clamp_i64_to_int(nh)};
             }
             XFree(data);
         } else if(data) XFree(data);
@@ -816,16 +988,31 @@ static unsigned long ximage_pixel_fast(const XImage *xi, int x, int y) {
     return XGetPixel((XImage *)xi, x, y);
 }
 
-static Image ximage_to_rgb(XImage *xi, Rect crop) {
+static Image ximage_to_rgb(XCtx *x, XImage *xi, Rect crop) {
     crop = rect_intersect(crop, (Rect){0, 0, xi->width, xi->height});
     Image im = image_new(crop.w, crop.h);
+    bool indexed = xi->red_mask == 0 && xi->green_mask == 0 && xi->blue_mask == 0;
+    XColor palette[256];
+    int palette_n = 0;
+    if (indexed && xi->depth <= 8) {
+        palette_n = 1 << xi->depth;
+        if (palette_n > 256) palette_n = 256;
+        for (int i = 0; i < palette_n; ++i) { palette[i].pixel = (unsigned long)i; palette[i].flags = DoRed|DoGreen|DoBlue; }
+        XQueryColors(x->dpy, DefaultColormap(x->dpy, x->screen), palette, palette_n);
+    }
     for (int y = 0; y < crop.h; ++y) {
-        for (int x = 0; x < crop.w; ++x) {
-            unsigned long p = ximage_pixel_fast(xi, crop.x + x, crop.y + y);
-            uint8_t *q = im.rgb + ((size_t)y * crop.w + x) * 3;
-            q[0] = component_from_mask(p, xi->red_mask);
-            q[1] = component_from_mask(p, xi->green_mask);
-            q[2] = component_from_mask(p, xi->blue_mask);
+        for (int xx = 0; xx < crop.w; ++xx) {
+            unsigned long p = ximage_pixel_fast(xi, crop.x + xx, crop.y + y);
+            uint8_t *q = im.rgb + ((size_t)y * crop.w + xx) * 3;
+            if (palette_n > 0 && p < (unsigned long)palette_n) {
+                q[0] = (uint8_t)(palette[p].red / 257u);
+                q[1] = (uint8_t)(palette[p].green / 257u);
+                q[2] = (uint8_t)(palette[p].blue / 257u);
+            } else {
+                q[0] = component_from_mask(p, xi->red_mask);
+                q[1] = component_from_mask(p, xi->green_mask);
+                q[2] = component_from_mask(p, xi->blue_mask);
+            }
         }
     }
     return im;
@@ -834,35 +1021,35 @@ static Image ximage_to_rgb(XImage *xi, Rect crop) {
 static Image capture_root(XCtx *x, Rect r) {
     r=rect_intersect(r,(Rect){0,0,x->root_w,x->root_h});
     if(!rect_valid(r)) die("capture rectangle is outside the X11 root window");
-    g_xerror=0;
+    xerror_begin(x->dpy);
     XImage *xi=XGetImage(x->dpy,x->root,r.x,r.y,(unsigned)r.w,(unsigned)r.h,AllPlanes,ZPixmap);
-    XSync(x->dpy,False);
-    if(!xi || g_xerror) die("XGetImage failed for %dx%d+%d+%d",r.w,r.h,r.x,r.y);
-    Image im=ximage_to_rgb(xi,(Rect){0,0,r.w,r.h}); XDestroyImage(xi); return im;
+    int xe = xerror_end(x->dpy);
+    if(!xi || xe) { if (xi) XDestroyImage(xi); die("XGetImage failed for %dx%d+%d+%d",r.w,r.h,r.x,r.y); }
+    Image im=ximage_to_rgb(x,xi,(Rect){0,0,r.w,r.h}); XDestroyImage(xi); return im;
 }
 
 static Image capture_window_content(XCtx *x, Window w, bool try_composite) {
     XWindowAttributes a;
     if(!XGetWindowAttributes(x->dpy,w,&a) || a.width<=0 || a.height<=0) die("cannot query window 0x%lx",w);
     Drawable dr=w; Pixmap pm=None;
-    if(try_composite && x->ext.XCompositeNameWindowPixmap) {
-        g_xerror=0; pm=x->ext.XCompositeNameWindowPixmap(x->dpy,w); XSync(x->dpy,False);
-        if(!g_xerror && pm!=None) dr=pm; else pm=None;
+    if(try_composite && x->composite_ok) {
+        xerror_begin(x->dpy); pm=x->ext.XCompositeNameWindowPixmap(x->dpy,w);
+        if(!xerror_end(x->dpy) && pm!=None) dr=pm; else pm=None;
     }
-    g_xerror=0;
+    xerror_begin(x->dpy);
     XImage *xi=XGetImage(x->dpy,dr,0,0,(unsigned)a.width,(unsigned)a.height,AllPlanes,ZPixmap);
-    XSync(x->dpy,False);
+    int xe = xerror_end(x->dpy);
     if(pm!=None) XFreePixmap(x->dpy,pm);
-    if(!xi || g_xerror) {
+    if(!xi || xe) {
         if(xi) XDestroyImage(xi);                   /* don't leak a valid image on async error */
         Rect r; if(!window_absolute_rect(x,w,false,&r)) die("cannot capture window 0x%lx",w);
         return capture_root(x,r);
     }
-    Image im=ximage_to_rgb(xi,(Rect){0,0,a.width,a.height}); XDestroyImage(xi); return im;
+    Image im=ximage_to_rgb(x,xi,(Rect){0,0,a.width,a.height}); XDestroyImage(xi); return im;
 }
 
 static void compose_cursor(XCtx *x, Image *im, Rect capture_rect) {
-    if(!x->ext.XFixesGetCursorImage) { warnx("XFixes is unavailable; cursor was not captured"); return; }
+    if(!x->fixes_ok) { warnx("XFixes is unavailable; cursor was not captured"); return; }
     DynXFixesCursorImage *ci=x->ext.XFixesGetCursorImage(x->dpy);
     if(!ci) { warnx("XFixesGetCursorImage failed"); return; }
     int ox=(int)ci->x-(int)ci->xhot-capture_rect.x, oy=(int)ci->y-(int)ci->yhot-capture_rect.y;
@@ -880,22 +1067,26 @@ static void compose_cursor(XCtx *x, Image *im, Rect capture_rect) {
 }
 
 static Rect *get_monitors(XCtx *x, int *count) {
-    *count=0;
-    if(x->ext.XRRGetMonitors && x->ext.XRRFreeMonitors) {
-        int n=0; DynXRRMonitorInfo *mi=x->ext.XRRGetMonitors(x->dpy,x->root,True,&n);
-        if(mi && n>0) {
-            Rect *r=xcalloc((size_t)n,sizeof(*r));
-            for(int i=0;i<n;++i) r[i]=(Rect){mi[i].x,mi[i].y,mi[i].width,mi[i].height};
-            x->ext.XRRFreeMonitors(mi); *count=n; return r;
-        }
-        if(mi) x->ext.XRRFreeMonitors(mi);
+    *count = 0;
+    if (!x->randr_ok) return NULL;
+    xerror_begin(x->dpy);
+    int n = 0;
+    DynXRRMonitorInfo *mi = x->ext.XRRGetMonitors(x->dpy, x->root, True, &n);
+    int xe = xerror_end(x->dpy);
+    if (!mi || xe || n <= 0) { if (mi) x->ext.XRRFreeMonitors(mi); return NULL; }
+    Rect *r = xcalloc((size_t)n, sizeof(*r));
+    for (int i = 0; i < n; ++i) {
+        if (mi[i].width <= 0 || mi[i].height <= 0) { free(r); x->ext.XRRFreeMonitors(mi); return NULL; }
+        r[i] = (Rect){mi[i].x, mi[i].y, mi[i].width, mi[i].height};
     }
-    Rect *r=xmalloc(sizeof(*r)); *r=(Rect){0,0,x->root_w,x->root_h}; *count=1; return r;
+    x->ext.XRRFreeMonitors(mi);
+    *count = n;
+    return r;
 }
 
 static Window window_at_point(XCtx *x, int px, int py) {
     unsigned char *data=NULL; unsigned long n=0; Atom actual; int fmt;
-    if(get_property(x->dpy,x->root,atom(x->dpy,"_NET_CLIENT_LIST_STACKING"),XA_WINDOW,&data,&n,&actual,&fmt) && fmt==32) {
+    if(get_property_limited(x->dpy,x->root,atom(x->dpy,"_NET_CLIENT_LIST_STACKING"),XA_WINDOW,1048576,&data,&n,&actual,&fmt) && fmt==32) {
         Window *ws=(Window*)data;
         for(long i=(long)n-1;i>=0;--i) { Rect r; if(window_absolute_rect(x,ws[i],true,&r) && px>=r.x&&py>=r.y&&px<r.x+r.w&&py<r.y+r.h) { Window w=ws[i]; XFree(data); return w; } }
         XFree(data);
@@ -918,20 +1109,25 @@ static bool window_class_matches(Display *d, Window w, const char *want) {
 
 static Image capture_stack_under_pointer(XCtx *x, bool vertical, const char *class_name, bool composite, Rect *logical_rect) {
     Window rr,child; int px,py,wx,wy; unsigned mask;
-    if(!XQueryPointer(x->dpy,x->root,&rr,&child,&px,&py,&wx,&wy,&mask)) die("cannot query pointer");
-    unsigned char *data=NULL; unsigned long n=0; Atom actual; int fmt;
-    if(!get_property(x->dpy,x->root,atom(x->dpy,"_NET_CLIENT_LIST_STACKING"),XA_WINDOW,&data,&n,&actual,&fmt)||fmt!=32) die("_NET_CLIENT_LIST_STACKING is unavailable");
-    Window *ws=(Window*)data; Window *sel=xcalloc(n?n:1,sizeof(Window)); int ns=0;
-    for(unsigned long i=0;i<n;++i) {
-        Rect r; if(window_absolute_rect(x,ws[i],false,&r)&&px>=r.x&&py>=r.y&&px<r.x+r.w&&py<r.y+r.h&&window_class_matches(x->dpy,ws[i],class_name)) { sel[ns++]=ws[i]; }
-    }
-    XFree(data); if(ns==0){free(sel);die("no matching windows are stacked under the pointer");}
-    Image *parts=xcalloc((size_t)ns,sizeof(Image)); int64_t ow=0,oh=0;
-    for(int i=0;i<ns;++i) { parts[i]=capture_window_content(x,sel[i],composite); if(vertical){if(parts[i].w>ow)ow=parts[i].w;oh+=parts[i].h;}else{ow+=parts[i].w;if(parts[i].h>oh)oh=parts[i].h;} }
-    if(ow<=0||oh<=0||ow>100000||oh>100000){for(int i=0;i<ns;++i)image_free(&parts[i]);free(parts);free(sel);die("joined stack area is too large");}
-    Image out=image_new((int)ow,(int)oh); int ox=0,oy=0;
-    for(int i=0;i<ns;++i) { for(int y=0;y<parts[i].h;++y) memcpy(out.rgb+((size_t)(oy+y)*(size_t)ow+(size_t)ox)*3,parts[i].rgb+(size_t)y*parts[i].w*3,(size_t)parts[i].w*3); if(vertical)oy+=parts[i].h;else ox+=parts[i].w; image_free(&parts[i]); }
-    free(parts);free(sel); *logical_rect=(Rect){0,0,(int)ow,(int)oh}; return out;
+    if(!XQueryPointer(x->dpy,x->root,&rr,&child,&px,&py,&wx,&wy,&mask))die("cannot query pointer");
+    unsigned char *data=NULL;unsigned long n=0;Atom actual;int fmt;
+    if(!get_property_limited(x->dpy,x->root,atom(x->dpy,"_NET_CLIENT_LIST_STACKING"),XA_WINDOW,1048576,&data,&n,&actual,&fmt)||fmt!=32)
+        die("_NET_CLIENT_LIST_STACKING is unavailable");
+    Window *ws=(Window*)data,*sel=xcalloc(n?n:1,sizeof(Window));int ns=0;
+    for(unsigned long i=0;i<n;++i){Rect r;if(window_absolute_rect(x,ws[i],false,&r)&&px>=r.x&&py>=r.y&&px<r.x+r.w&&py<r.y+r.h&&window_class_matches(x->dpy,ws[i],class_name))sel[ns++]=ws[i];}
+    XFree(data);if(ns==0){free(sel);die("no matching windows are stacked under the pointer");}
+
+    Rect *dims=xcalloc((size_t)ns,sizeof(*dims));int64_t ow=0,oh=0;uint64_t largest=0;
+    for(int i=0;i<ns;++i){XWindowAttributes a;if(!XGetWindowAttributes(x->dpy,sel[i],&a)||a.width<=0||a.height<=0){free(dims);free(sel);die("a stacked window disappeared before capture");}
+        dims[i]=(Rect){0,0,a.width,a.height};uint64_t bytes=(uint64_t)(unsigned)a.width*(uint64_t)(unsigned)a.height*3u;if(bytes>largest)largest=bytes;
+        if(vertical){if(a.width>ow)ow=a.width;oh+=a.height;}else{ow+=a.width;if(a.height>oh)oh=a.height;}}
+    if(ow<=0||oh<=0||ow>INT_MAX||oh>INT_MAX){free(dims);free(sel);die("joined stack area is too large");}
+    uint64_t outbytes=(uint64_t)ow*(uint64_t)oh*3u;ensure_work_budget(outbytes+largest,"stack capture");
+    Image out=image_new((int)ow,(int)oh);int ox=0,oy=0;
+    for(int i=0;i<ns;++i){Image part=capture_window_content(x,sel[i],composite);if(part.w!=dims[i].w||part.h!=dims[i].h){image_free(&part);image_free(&out);free(dims);free(sel);die("a stacked window resized during capture; retry");}
+        for(int y=0;y<part.h;++y)memcpy(out.rgb+((size_t)(oy+y)*(size_t)ow+(size_t)ox)*3,part.rgb+(size_t)y*(size_t)part.w*3,(size_t)part.w*3);
+        if(vertical)oy+=part.h;else ox+=part.w;image_free(&part);}
+    free(dims);free(sel);*logical_rect=(Rect){0,0,(int)ow,(int)oh};return out;
 }
 
 /* ------------------------------- i3 IPC ----------------------------------- */
@@ -939,127 +1135,267 @@ static Image capture_stack_under_pointer(XCtx *x, bool vertical, const char *cla
 typedef enum { JT_UNDEF, JT_OBJECT, JT_ARRAY, JT_STRING, JT_PRIMITIVE } JType;
 typedef struct { JType type; int start,end,size,parent; } JTok;
 
-typedef struct { unsigned pos,next; int super; } JParser;
+typedef struct {
+    const char *js;
+    size_t len, pos, n, cap;
+    unsigned depth;
+    JTok *t;
+} JReader;
 
-static int json_parse(const char *js,size_t len,JTok **out) {
-    size_t cap=512,n=0; JTok *t=xcalloc(cap,sizeof(*t)); JParser p={0,0,-1};
-#define NEWTOK() (n==cap?(cap*=2,t=xrealloc(t,cap*sizeof(*t))):t, &t[n++])
-    while(p.pos<len) {
-        char c=js[p.pos];
-        if(c=='{'||c=='[') { JTok *q=NEWTOK(); *q=(JTok){c=='{'?JT_OBJECT:JT_ARRAY,(int)p.pos,-1,0,p.super}; if(p.super>=0)t[p.super].size++; p.super=(int)n-1; p.pos++; continue; }
-        if(c=='}'||c==']') { JType want=c=='}'?JT_OBJECT:JT_ARRAY; int i=(int)n-1; for(;i>=0;--i)if(t[i].start>=0&&t[i].end<0){if(t[i].type!=want){free(t);return -1;}t[i].end=(int)p.pos+1;p.super=t[i].parent;break;}if(i<0){free(t);return -1;}p.pos++;continue; }
-        if(c=='\"') { size_t st=++p.pos; bool ok=false; while(p.pos<len){c=js[p.pos];if(c=='\"'){ok=true;break;}if(c=='\\'){p.pos++;if(p.pos>=len)break;}p.pos++;}if(!ok){free(t);return -1;}JTok*q=NEWTOK();*q=(JTok){JT_STRING,(int)st,(int)p.pos,0,p.super};if(p.super>=0)t[p.super].size++;p.pos++;continue; }
-        if(isspace((unsigned char)c)||c==':'||c==','){p.pos++;continue;}
-        size_t st=p.pos;while(p.pos<len&&!isspace((unsigned char)js[p.pos])&&strchr(",]}:",js[p.pos])==NULL)p.pos++;JTok*q=NEWTOK();*q=(JTok){JT_PRIMITIVE,(int)st,(int)p.pos,0,p.super};if(p.super>=0)t[p.super].size++;
+static void json_skip_ws(JReader *p) {
+    while (p->pos < p->len && isspace((unsigned char)p->js[p->pos])) ++p->pos;
+}
+
+static int json_new_token(JReader *p, JType type, int parent, size_t start) {
+    if (p->n >= I3SHOT_MAX_JSON_TOKENS || start > INT_MAX) return -1;
+    if (p->n == p->cap) {
+        size_t nc = p->cap ? p->cap * 2 : 512;
+        if (nc > I3SHOT_MAX_JSON_TOKENS) nc = I3SHOT_MAX_JSON_TOKENS;
+        if (nc <= p->cap || nc > SIZE_MAX / sizeof(*p->t)) return -1;
+        p->t = xrealloc(p->t, nc * sizeof(*p->t));
+        p->cap = nc;
     }
-    for(size_t i=0;i<n;++i)if((t[i].type==JT_OBJECT||t[i].type==JT_ARRAY)&&t[i].end<0){free(t);return -1;}
-#undef NEWTOK
-    *out=t; return (int)n;
+    int idx = (int)p->n++;
+    p->t[idx] = (JTok){type, (int)start, -1, 0, parent};
+    if (parent >= 0) p->t[parent].size++;
+    return idx;
+}
+
+static bool json_hex4_at(const char *s, size_t n, size_t pos, unsigned *out) {
+    if (pos + 4 > n) return false;
+    unsigned v = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        unsigned char c = (unsigned char)s[pos+i];
+        unsigned d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return true;
+}
+
+static int json_parse_string(JReader *p, int parent) {
+    if (p->pos >= p->len || p->js[p->pos] != '"') return -1;
+    size_t start = ++p->pos;
+    while (p->pos < p->len) {
+        unsigned char c = (unsigned char)p->js[p->pos++];
+        if (c == '"') {
+            int idx = json_new_token(p, JT_STRING, parent, start);
+            if (idx < 0 || p->pos - 1 > INT_MAX) return -1;
+            p->t[idx].end = (int)(p->pos - 1);
+            return idx;
+        }
+        if (c < 0x20 || c == 0) return -1;
+        if (c != '\\') continue;
+        if (p->pos >= p->len) return -1;
+        c = (unsigned char)p->js[p->pos++];
+        if (strchr("\"\\/bfnrt", (int)c)) continue;
+        if (c != 'u') return -1;
+        unsigned u = 0;
+        if (!json_hex4_at(p->js, p->len, p->pos, &u)) return -1;
+        p->pos += 4;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            if (p->pos + 6 > p->len || p->js[p->pos] != '\\' || p->js[p->pos+1] != 'u') return -1;
+            unsigned lo = 0;
+            if (!json_hex4_at(p->js, p->len, p->pos + 2, &lo) || lo < 0xDC00 || lo > 0xDFFF) return -1;
+            p->pos += 6;
+        } else if (u >= 0xDC00 && u <= 0xDFFF) return -1;
+    }
+    return -1;
+}
+
+static bool json_number_end(const char *s, size_t n, size_t *pos) {
+    size_t i = *pos;
+    if (i < n && s[i] == '-') ++i;
+    if (i >= n) return false;
+    if (s[i] == '0') ++i;
+    else {
+        if (s[i] < '1' || s[i] > '9') return false;
+        while (i < n && isdigit((unsigned char)s[i])) ++i;
+    }
+    if (i < n && s[i] == '.') {
+        ++i;
+        if (i >= n || !isdigit((unsigned char)s[i])) return false;
+        while (i < n && isdigit((unsigned char)s[i])) ++i;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        ++i;
+        if (i < n && (s[i] == '+' || s[i] == '-')) ++i;
+        if (i >= n || !isdigit((unsigned char)s[i])) return false;
+        while (i < n && isdigit((unsigned char)s[i])) ++i;
+    }
+    *pos = i;
+    return true;
+}
+
+static int json_parse_value(JReader *p, int parent);
+
+static int json_parse_object(JReader *p, int parent) {
+    size_t start = p->pos++;
+    int obj = json_new_token(p, JT_OBJECT, parent, start);
+    if (obj < 0 || ++p->depth > I3SHOT_MAX_JSON_DEPTH) return -1;
+    json_skip_ws(p);
+    if (p->pos < p->len && p->js[p->pos] == '}') { p->t[obj].end = (int)++p->pos; --p->depth; return obj; }
+    for (;;) {
+        if (json_parse_string(p, obj) < 0) return -1;
+        json_skip_ws(p);
+        if (p->pos >= p->len || p->js[p->pos++] != ':') return -1;
+        json_skip_ws(p);
+        if (json_parse_value(p, obj) < 0) return -1;
+        json_skip_ws(p);
+        if (p->pos >= p->len) return -1;
+        char c = p->js[p->pos++];
+        if (c == '}') { p->t[obj].end = (int)p->pos; --p->depth; return obj; }
+        if (c != ',') return -1;
+        json_skip_ws(p);
+    }
+}
+
+static int json_parse_array(JReader *p, int parent) {
+    size_t start = p->pos++;
+    int arr = json_new_token(p, JT_ARRAY, parent, start);
+    if (arr < 0 || ++p->depth > I3SHOT_MAX_JSON_DEPTH) return -1;
+    json_skip_ws(p);
+    if (p->pos < p->len && p->js[p->pos] == ']') { p->t[arr].end = (int)++p->pos; --p->depth; return arr; }
+    for (;;) {
+        if (json_parse_value(p, arr) < 0) return -1;
+        json_skip_ws(p);
+        if (p->pos >= p->len) return -1;
+        char c = p->js[p->pos++];
+        if (c == ']') { p->t[arr].end = (int)p->pos; --p->depth; return arr; }
+        if (c != ',') return -1;
+        json_skip_ws(p);
+    }
+}
+
+static int json_parse_value(JReader *p, int parent) {
+    json_skip_ws(p);
+    if (p->pos >= p->len || p->js[p->pos] == '\0') return -1;
+    if (p->js[p->pos] == '{') return json_parse_object(p, parent);
+    if (p->js[p->pos] == '[') return json_parse_array(p, parent);
+    if (p->js[p->pos] == '"') return json_parse_string(p, parent);
+    size_t start = p->pos;
+    if (p->js[p->pos] == 't' && p->pos + 4 <= p->len && !memcmp(p->js+p->pos,"true",4)) p->pos += 4;
+    else if (p->js[p->pos] == 'f' && p->pos + 5 <= p->len && !memcmp(p->js+p->pos,"false",5)) p->pos += 5;
+    else if (p->js[p->pos] == 'n' && p->pos + 4 <= p->len && !memcmp(p->js+p->pos,"null",4)) p->pos += 4;
+    else if (!json_number_end(p->js, p->len, &p->pos)) return -1;
+    int idx = json_new_token(p, JT_PRIMITIVE, parent, start);
+    if (idx < 0 || p->pos > INT_MAX) return -1;
+    p->t[idx].end = (int)p->pos;
+    return idx;
+}
+
+static int json_parse(const char *js, size_t len, JTok **out) {
+    *out = NULL;
+    if (!js || len == 0 || len > INT_MAX || memchr(js, '\0', len)) return -1;
+    JReader p = {.js=js,.len=len};
+    json_skip_ws(&p);
+    if (json_parse_value(&p, -1) < 0) { free(p.t); return -1; }
+    json_skip_ws(&p);
+    if (p.pos != p.len || p.n == 0 || p.n > INT_MAX) { free(p.t); return -1; }
+    *out = p.t;
+    return (int)p.n;
 }
 
 static bool tok_eq(const char *js,const JTok*t,const char*s){size_t n=strlen(s);return t->type==JT_STRING&&(size_t)(t->end-t->start)==n&&!memcmp(js+t->start,s,n);}
 static bool tok_prim_eq(const char *js,const JTok*t,const char*s){size_t n=strlen(s);return t->type==JT_PRIMITIVE&&(size_t)(t->end-t->start)==n&&!memcmp(js+t->start,s,n);}
-static long tok_long(const char*js,const JTok*t,long def){char b[64];int n=t->end-t->start;if(n<=0||n>=(int)sizeof(b))return def;memcpy(b,js+t->start,n);b[n]=0;char*e;errno=0;long v=strtol(b,&e,0);return errno||*e?def:v;}
-static int hex4(const char*p){int v=0;for(int i=0;i<4;++i){char c=p[i];int d;if(c>='0'&&c<='9')d=c-'0';else if(c>='a'&&c<='f')d=c-'a'+10;else if(c>='A'&&c<='F')d=c-'A'+10;else return -1;v=(v<<4)|d;}return v;}
-static void utf8_put(char**o,unsigned cp){unsigned char*q=(unsigned char*)*o;if(cp<0x80){*q++=(unsigned char)cp;}else if(cp<0x800){*q++=(unsigned char)(0xC0|(cp>>6));*q++=(unsigned char)(0x80|(cp&0x3F));}else if(cp<0x10000){*q++=(unsigned char)(0xE0|(cp>>12));*q++=(unsigned char)(0x80|((cp>>6)&0x3F));*q++=(unsigned char)(0x80|(cp&0x3F));}else{*q++=(unsigned char)(0xF0|(cp>>18));*q++=(unsigned char)(0x80|((cp>>12)&0x3F));*q++=(unsigned char)(0x80|((cp>>6)&0x3F));*q++=(unsigned char)(0x80|(cp&0x3F));}*o=(char*)q;}
-static char *tok_string(const char*js,const JTok*t){if(t->type!=JT_STRING)return xstrdup("");int n=t->end-t->start;char *s=xmalloc((size_t)n*3+4);char*o=s;for(int i=t->start;i<t->end;++i){char c=js[i];if(c=='\\'&&i+1<t->end){c=js[++i];switch(c){case'n':*o++='\n';break;case'r':*o++='\r';break;case't':*o++='\t';break;case'b':*o++='\b';break;case'f':*o++='\f';break;case'/':*o++='/';break;case'\\':*o++='\\';break;case'"':*o++='"';break;case'u':{if(i+4<t->end){int u=hex4(js+i+1);if(u>=0){i+=4;unsigned cp=(unsigned)u;if(cp>=0xD800&&cp<=0xDBFF&&i+6<t->end&&js[i+1]=='\\'&&js[i+2]=='u'){int lo=hex4(js+i+3);if(lo>=0xDC00&&lo<=0xDFFF){cp=0x10000u+((cp-0xD800u)<<10)+((unsigned)lo-0xDC00u);i+=6;}}utf8_put(&o,cp);}else *o++='u';}else *o++='u';}break;default:*o++=c;break;}}else *o++=c;}*o=0;return s;}
 
-static int tok_next_sibling(const JTok*t,int nt,int idx){int end=t[idx].end;int i=idx+1;while(i<nt&&t[i].start<end&&t[i].parent>=idx)i++;return i;}
-static int object_get(const char*js,const JTok*t,int nt,int obj,const char*key){if(obj<0||obj>=nt||t[obj].type!=JT_OBJECT)return -1;for(int i=obj+1;i<nt&&t[i].start<t[obj].end;){if(t[i].parent==obj&&t[i].type==JT_STRING){int v=i+1;if(tok_eq(js,&t[i],key)&&v<nt&&t[v].parent==obj)return v;i=tok_next_sibling(t,nt,v);}else i++;}return -1;}
-
-static int find_object_field(const char*js,const JTok*t,int nt,int root,const char*key,const char*value,JType vt){for(int i=root;i<nt&&t[i].start<t[root].end;++i){if(t[i].type!=JT_OBJECT)continue;int v=object_get(js,t,nt,i,key);if(v>=0&&t[v].type==vt){bool eq=vt==JT_STRING?tok_eq(js,&t[v],value):tok_prim_eq(js,&t[v],value);if(eq)return i;}}return -1;}
-
-static bool object_rect(const char*js,const JTok*t,int nt,int obj,const char*field,Rect*r){int q=object_get(js,t,nt,obj,field);if(q<0||t[q].type!=JT_OBJECT)return false;int x=object_get(js,t,nt,q,"x"),y=object_get(js,t,nt,q,"y"),w=object_get(js,t,nt,q,"width"),h=object_get(js,t,nt,q,"height");if(x<0||y<0||w<0||h<0)return false;*r=(Rect){(int)tok_long(js,&t[x],0),(int)tok_long(js,&t[y],0),(int)tok_long(js,&t[w],0),(int)tok_long(js,&t[h],0)};return rect_valid(*r);}
-
-static char *x11_i3_socket(XCtx*x){unsigned char*data=NULL;unsigned long n=0;Atom actual;int fmt;if(get_property(x->dpy,x->root,atom(x->dpy,"I3_SOCKET_PATH"),AnyPropertyType,&data,&n,&actual,&fmt)&&fmt==8){if(n>4096){XFree(data);return NULL;}char*s=xmalloc(n+1);memcpy(s,data,n);s[n]=0;XFree(data);return s;}if(data)XFree(data);return NULL;}
-
-/* Monotonic milliseconds for IPC deadlines. */
-static long now_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+static bool tok_long_checked(const char *js, const JTok *t, long lo, long hi, long *out) {
+    if (!t || t->type != JT_PRIMITIVE) return false;
+    int n = t->end - t->start;
+    if (n <= 0 || n >= 64) return false;
+    char b[64]; memcpy(b, js+t->start, (size_t)n); b[n] = 0;
+    char *e = NULL; errno = 0; long v = strtol(b, &e, 10);
+    if (errno || e == b || *e || v < lo || v > hi) return false;
+    *out = v; return true;
 }
 
-/* Wait for readiness on one fd, bounded and signal-aware. */
-static bool fd_wait(int fd, short events, long deadline) {
+static bool tok_window_checked(const char *js, const JTok *t, Window *out) {
+    if (!t || t->type != JT_PRIMITIVE) return false;
+    int n=t->end-t->start; if(n<=0||n>=64)return false;
+    char b[64]; memcpy(b,js+t->start,(size_t)n); b[n]=0;
+    if (b[0]=='-' || b[0]=='+') return false;
+    char *e=NULL; errno=0; unsigned long v=strtoul(b,&e,10);
+    if(errno||e==b||*e||v>0xFFFFFFFFUL)return false;
+    *out=(Window)v; return true;
+}
+
+static int hex4(const char*p){int v=0;for(int i=0;i<4;++i){char c=p[i];int d;if(c>='0'&&c<='9')d=c-'0';else if(c>='a'&&c<='f')d=c-'a'+10;else if(c>='A'&&c<='F')d=c-'A'+10;else return -1;v=(v<<4)|d;}return v;}
+static void utf8_put(char**o,unsigned cp){unsigned char*q=(unsigned char*)*o;if(cp<0x80){*q++=(unsigned char)cp;}else if(cp<0x800){*q++=(unsigned char)(0xC0|(cp>>6));*q++=(unsigned char)(0x80|(cp&0x3F));}else if(cp<0x10000){*q++=(unsigned char)(0xE0|(cp>>12));*q++=(unsigned char)(0x80|((cp>>6)&0x3F));*q++=(unsigned char)(0x80|(cp&0x3F));}else{*q++=(unsigned char)(0xF0|(cp>>18));*q++=(unsigned char)(0x80|((cp>>12)&0x3F));*q++=(unsigned char)(0x80|((cp>>6)&0x3F));*q++=(unsigned char)(0x80|(cp&0x3F));}*o=(char*)q;}
+static char *tok_string(const char*js,const JTok*t){if(t->type!=JT_STRING)return xstrdup("");int n=t->end-t->start;char *s=xmalloc((size_t)n*3+4);char*o=s;for(int i=t->start;i<t->end;++i){char c=js[i];if(c=='\\'&&i+1<t->end){c=js[++i];switch(c){case'n':*o++='\n';break;case'r':*o++='\r';break;case't':*o++='\t';break;case'b':*o++='\b';break;case'f':*o++='\f';break;case'/':*o++='/';break;case'\\':*o++='\\';break;case'"':*o++='"';break;case'u':{int u=hex4(js+i+1);i+=4;unsigned cp=(unsigned)u;if(cp>=0xD800&&cp<=0xDBFF){int lo=hex4(js+i+3);cp=0x10000u+((cp-0xD800u)<<10)+((unsigned)lo-0xDC00u);i+=6;}utf8_put(&o,cp);}break;default:break;}}else *o++=c;}*o=0;return s;}
+
+static int tok_next_sibling(const JTok*t,int nt,int idx){int end=t[idx].end;int i=idx+1;while(i<nt&&t[i].start<end)i++;return i;}
+static int object_get(const char*js,const JTok*t,int nt,int obj,const char*key){if(obj<0||obj>=nt||t[obj].type!=JT_OBJECT)return -1;for(int i=obj+1;i<nt&&t[i].start<t[obj].end;){if(t[i].parent==obj&&t[i].type==JT_STRING){int v=i+1;if(v<nt&&t[v].parent==obj&&tok_eq(js,&t[i],key))return v;i=(v<nt)?tok_next_sibling(t,nt,v):i+1;}else i++;}return -1;}
+static int find_object_field(const char*js,const JTok*t,int nt,int root,const char*key,const char*value,JType vt){for(int i=root;i<nt&&t[i].start<t[root].end;++i){if(t[i].type!=JT_OBJECT)continue;int v=object_get(js,t,nt,i,key);if(v>=0&&t[v].type==vt){bool eq=vt==JT_STRING?tok_eq(js,&t[v],value):tok_prim_eq(js,&t[v],value);if(eq)return i;}}return -1;}
+
+static bool object_rect(const char*js,const JTok*t,int nt,int obj,const char*field,Rect*r){
+    int q=object_get(js,t,nt,obj,field);if(q<0||t[q].type!=JT_OBJECT)return false;
+    int xi=object_get(js,t,nt,q,"x"), yi=object_get(js,t,nt,q,"y"), wi=object_get(js,t,nt,q,"width"), hi=object_get(js,t,nt,q,"height");
+    if(xi<0||yi<0||wi<0||hi<0)return false;
+    long x,y,w,h;
+    if(!tok_long_checked(js,&t[xi],INT_MIN,INT_MAX,&x)||!tok_long_checked(js,&t[yi],INT_MIN,INT_MAX,&y)||
+       !tok_long_checked(js,&t[wi],1,INT_MAX,&w)||!tok_long_checked(js,&t[hi],1,INT_MAX,&h))return false;
+    *r=(Rect){(int)x,(int)y,(int)w,(int)h};return true;
+}
+
+static char *x11_i3_socket(XCtx*x){unsigned char*data=NULL;unsigned long n=0;Atom actual;int fmt;if(get_property_limited(x->dpy,x->root,atom(x->dpy,"I3_SOCKET_PATH"),AnyPropertyType,4096,&data,&n,&actual,&fmt)&&fmt==8&&n>0){char*s=xmalloc(n+1);memcpy(s,data,n);s[n]=0;XFree(data);return s;}if(data)XFree(data);return NULL;}
+
+typedef enum { I3E_NONE, I3E_NO_SOCKET, I3E_CONNECT, I3E_TIMEOUT, I3E_PROTOCOL, I3E_TYPE, I3E_SIZE, I3E_READ, I3E_JSON, I3E_FIELD } I3Error;
+static I3Error g_i3_error = I3E_NONE;
+static const char *i3_error_text(void){switch(g_i3_error){case I3E_NO_SOCKET:return"no i3 IPC socket was found";case I3E_CONNECT:return"cannot connect to the i3 IPC socket";case I3E_TIMEOUT:return"i3 IPC request timed out";case I3E_PROTOCOL:return"invalid i3 IPC reply header";case I3E_TYPE:return"i3 IPC reply type did not match the request";case I3E_SIZE:return"i3 IPC reply is too large";case I3E_READ:return"i3 IPC reply was incomplete";case I3E_JSON:return"i3 IPC returned invalid JSON";case I3E_FIELD:return"required data is missing from the i3 IPC reply";default:return"unknown i3 IPC error";}}
+
+typedef struct { char *data; size_t len; } I3Reply;
+static void i3_reply_free(I3Reply *r){if(r){free(r->data);r->data=NULL;r->len=0;}}
+
+static int64_t now_ms(void){struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)<0)return 0;return(int64_t)ts.tv_sec*1000+ts.tv_nsec/1000000;}
+
+static bool fd_wait(int fd, short events, int64_t deadline) {
     for (;;) {
-        long rem = deadline - now_ms();
-        if (rem <= 0 || g_interrupted) return false;
-        struct pollfd p = { fd, events, 0 };
-        int r = poll(&p, 1, (int)MIN2(rem, 1000L));
-        if (r > 0) return (p.revents & (events | POLLERR | POLLHUP)) != 0;
-        if (r == 0) continue;
-        if (errno == EINTR) { if (g_interrupted) return false; continue; }
+        int64_t rem = deadline - now_ms();
+        if (rem <= 0 || g_interrupted) { g_i3_error = g_interrupted ? I3E_READ : I3E_TIMEOUT; return false; }
+        struct pollfd p[2]={{fd,events,0},{g_sigpipe[0],POLLIN,0}};
+        nfds_t n=(g_sigpipe[0]>=0)?2:1;
+        int timeout=(int)MIN2(rem,INT_MAX);
+        int r=poll(p,n,timeout);
+        if(r>0){if(n==2&&(p[1].revents&POLLIN)){unsigned char b[64];while(read(g_sigpipe[0],b,sizeof b)>0){}return false;}if(p[0].revents&(POLLNVAL|POLLERR))return false;if(p[0].revents&(events|POLLHUP))return true;continue;}
+        if(r==0){g_i3_error=I3E_TIMEOUT;return false;}
+        if(errno==EINTR)continue;
         return false;
     }
 }
 
-static bool sock_write_all(int fd, const void *buf, size_t len, long deadline) {
-    const uint8_t *p = buf;
-    while (len) {
-        if (!fd_wait(fd, POLLOUT, deadline)) return false;
-        ssize_t n = write(fd, p, len);
-        if (n < 0) { if (errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK) { if(g_interrupted) return false; continue; } return false; }
-        if (n == 0) return false;
-        p += (size_t)n; len -= (size_t)n;
-    }
-    return true;
+static bool sock_write_all(int fd,const void*buf,size_t len,int64_t deadline){const uint8_t*p=buf;while(len){if(!fd_wait(fd,POLLOUT,deadline))return false;ssize_t n=write(fd,p,len);if(n<0){if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK)continue;return false;}if(n==0)return false;p+=(size_t)n;len-=(size_t)n;}return true;}
+static bool sock_read_all(int fd,void*buf,size_t len,int64_t deadline){uint8_t*p=buf;while(len){if(!fd_wait(fd,POLLIN,deadline))return false;ssize_t n=read(fd,p,len);if(n<0){if(errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK)continue;return false;}if(n==0)return false;p+=(size_t)n;len-=(size_t)n;}return true;}
+
+static int sock_connect(const char *path,int64_t deadline){int fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK,0);if(fd<0)return-1;struct sockaddr_un sa;memset(&sa,0,sizeof(sa));sa.sun_family=AF_UNIX;size_t plen=strlen(path);if(plen>=sizeof(sa.sun_path)){close(fd);return-1;}memcpy(sa.sun_path,path,plen+1);socklen_t slen=(socklen_t)(offsetof(struct sockaddr_un,sun_path)+plen+1);if(connect(fd,(struct sockaddr*)&sa,slen)==0)return fd;if(errno!=EINPROGRESS){close(fd);return-1;}if(!fd_wait(fd,POLLOUT,deadline)){close(fd);return-1;}int err=0;socklen_t el=sizeof(err);if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&err,&el)<0||err){close(fd);return-1;}return fd;}
+
+static bool i3_request_path(const char *path,uint32_t type,const char*payload,int64_t deadline,I3Reply*out){
+    int fd=sock_connect(path,deadline);if(fd<0){g_i3_error=I3E_CONNECT;return false;}
+    size_t plen=payload?strlen(payload):0;if(plen>UINT32_MAX){close(fd);g_i3_error=I3E_SIZE;return false;}uint32_t len=(uint32_t)plen;
+    uint8_t hdr[14];memcpy(hdr,"i3-ipc",6);memcpy(hdr+6,&len,4);memcpy(hdr+10,&type,4);
+    if(!sock_write_all(fd,hdr,sizeof hdr,deadline)|| (len&&!sock_write_all(fd,payload,len,deadline))){close(fd);if(g_i3_error==I3E_NONE)g_i3_error=I3E_READ;return false;}
+    uint8_t rh[14];if(!sock_read_all(fd,rh,sizeof rh,deadline)){close(fd);if(g_i3_error==I3E_NONE)g_i3_error=I3E_READ;return false;}
+    if(memcmp(rh,"i3-ipc",6)){close(fd);g_i3_error=I3E_PROTOCOL;return false;}
+    uint32_t rlen,rtype;memcpy(&rlen,rh+6,4);memcpy(&rtype,rh+10,4);
+    if(rtype!=type){close(fd);g_i3_error=I3E_TYPE;return false;}
+    if(rlen>16u*1024u*1024u){close(fd);g_i3_error=I3E_SIZE;return false;}
+    char*data=xmalloc((size_t)rlen+1);if(!sock_read_all(fd,data,rlen,deadline)){free(data);close(fd);if(g_i3_error==I3E_NONE)g_i3_error=I3E_READ;return false;}close(fd);
+    if(memchr(data,'\0',rlen)){free(data);g_i3_error=I3E_PROTOCOL;return false;}data[rlen]=0;out->data=data;out->len=rlen;g_i3_error=I3E_NONE;return true;
 }
 
-static bool sock_read_all(int fd, void *buf, size_t len, long deadline) {
-    uint8_t *p = buf;
-    while (len) {
-        if (!fd_wait(fd, POLLIN, deadline)) return false;
-        ssize_t n = read(fd, p, len);
-        if (n < 0) { if (errno==EINTR||errno==EAGAIN||errno==EWOULDBLOCK) { if(g_interrupted) return false; continue; } return false; }
-        if (n == 0) return false;
-        p += (size_t)n; len -= (size_t)n;
-    }
-    return true;
-}
-
-/* Nonblocking connect with a deadline so a dead socket cannot hang us. */
-static int sock_connect(const char *path, long deadline) {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_un sa; memset(&sa, 0, sizeof(sa)); sa.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof(sa.sun_path)) { close(fd); return -1; }
-    strcpy(sa.sun_path, path);
-    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0) return fd;
-    if (errno != EINPROGRESS) { close(fd); return -1; }
-    if (!fd_wait(fd, POLLOUT, deadline)) { close(fd); return -1; }
-    int err = 0; socklen_t el = sizeof(err);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err) { close(fd); return -1; }
-    return fd;
-}
-
-/* Send one i3 IPC request and return the reply body (NUL-terminated), or NULL.
-   Enforces a strict deadline and requires the reply type to match the request. */
-static char *i3_request(XCtx *x, uint32_t type, const char *payload) {
-    const char *env = getenv("I3SOCK");
-    char *owned = NULL;
-    const char *path = (env && *env) ? env : (owned = x11_i3_socket(x));
-    if (!path || !*path) { free(owned); return NULL; }
-    long deadline = now_ms() + 3000;               /* 3s total budget */
-    int fd = sock_connect(path, deadline);
-    free(owned);
-    if (fd < 0) return NULL;
-
-    uint32_t len = (uint32_t)(payload ? strlen(payload) : 0);
-    uint8_t hdr[14]; memcpy(hdr, "i3-ipc", 6); memcpy(hdr + 6, &len, 4); memcpy(hdr + 10, &type, 4);
-    char *out = NULL;
-    if (sock_write_all(fd, hdr, sizeof(hdr), deadline) && (!len || sock_write_all(fd, payload, len, deadline))) {
-        uint8_t rh[14];
-        if (sock_read_all(fd, rh, sizeof(rh), deadline) && !memcmp(rh, "i3-ipc", 6)) {
-            uint32_t rlen, rtype; memcpy(&rlen, rh + 6, 4); memcpy(&rtype, rh + 10, 4);
-            if (rtype == type && rlen <= 16u * 1024u * 1024u) {   /* reply type must match request */
-                out = xmalloc((size_t)rlen + 1);
-                if (sock_read_all(fd, out, rlen, deadline)) out[rlen] = 0;
-                else { free(out); out = NULL; }
-            }
-        }
-    }
-    close(fd);
-    return out;
+static bool i3_request(XCtx*x,uint32_t type,const char*payload,I3Reply*out){
+    memset(out,0,sizeof(*out));g_i3_error=I3E_NO_SOCKET;
+    char*root_path=x11_i3_socket(x);const char*env=getenv("I3SOCK");
+    bool have_root=root_path&&*root_path;
+    bool have_env=!x->display_explicit&&env&&*env; /* never mix explicit -D with another session's socket */
+    if(!have_root&&!have_env){free(root_path);return false;}
+    int64_t total=now_ms()+I3SHOT_IPC_TIMEOUT_MS;
+    if(have_root){bool second=have_env&&strcmp(env,root_path);int64_t d=second?MIN2(total,now_ms()+I3SHOT_IPC_TIMEOUT_MS/2):total;if(i3_request_path(root_path,type,payload,d,out)){free(root_path);return true;}}
+    if(have_env&&(!have_root||strcmp(env,root_path))){if(i3_request_path(env,type,payload,total,out)){free(root_path);return true;}}
+    free(root_path);return false;
 }
 
 static int nearest_object_type(const char *js, const JTok *t, int nt, int idx, const char *type) {
@@ -1073,54 +1409,75 @@ static int nearest_object_type(const char *js, const JTok *t, int nt, int idx, c
 }
 
 static bool i3_tree_target(XCtx *x, const char *kind, Rect *r, Window *wid, char **title) {
-    char *js = i3_request(x, 4, "");
-    if (!js) return false;
+    I3Reply reply;
+    if (!i3_request(x, 4, "", &reply)) return false;
     JTok *t = NULL;
-    int nt = json_parse(js, strlen(js), &t);
-    if (nt < 1) { free(js); return false; }
+    int nt = json_parse(reply.data, reply.len, &t);
+    if (nt < 1) { g_i3_error = I3E_JSON; i3_reply_free(&reply); return false; }
 
-    int focused = find_object_field(js, t, nt, 0, "focused", "true", JT_PRIMITIVE);
+    int focused = find_object_field(reply.data, t, nt, 0, "focused", "true", JT_PRIMITIVE);
     int obj = focused;
     if (!strcmp(kind, "workspace") && focused >= 0)
-        obj = nearest_object_type(js, t, nt, focused, "workspace");
+        obj = nearest_object_type(reply.data, t, nt, focused, "workspace");
 
-    bool ok = obj >= 0 && object_rect(js, t, nt, obj, "rect", r);
+    bool ok = obj >= 0 && object_rect(reply.data, t, nt, obj, "rect", r);
     if (ok && wid) {
-        int w = object_get(js, t, nt, obj, "window");
-        *wid = (w >= 0 && !tok_prim_eq(js, &t[w], "null")) ? (Window)tok_long(js, &t[w], 0) : None;
+        int wi = object_get(reply.data, t, nt, obj, "window");
+        if (wi < 0 || tok_prim_eq(reply.data, &t[wi], "null")) *wid = None;
+        else if (!tok_window_checked(reply.data, &t[wi], wid)) ok = false;
     }
     if (ok && title) {
-        int n = object_get(js, t, nt, obj, "name");
-        *title = n >= 0 ? tok_string(js, &t[n]) : xstrdup("");
+        int ni = object_get(reply.data, t, nt, obj, "name");
+        *title = ni >= 0 ? tok_string(reply.data, &t[ni]) : xstrdup("");
     }
+    if (!ok) g_i3_error = I3E_FIELD;
     free(t);
-    free(js);
+    i3_reply_free(&reply);
     return ok;
 }
 
 static bool i3_window_rect(XCtx *x, Window window, Rect *r) {
-    char *js = i3_request(x, 4, "");
-    if (!js) return false;
+    I3Reply reply;
+    if (!i3_request(x, 4, "", &reply)) return false;
     JTok *t = NULL;
-    int nt = json_parse(js, strlen(js), &t);
+    int nt = json_parse(reply.data, reply.len, &t);
+    if (nt < 1) { g_i3_error = I3E_JSON; i3_reply_free(&reply); return false; }
     bool ok = false;
-    if (nt > 0) {
-        for (int i = 0; i < nt; ++i) {
-            if (t[i].type != JT_OBJECT) continue;
-            int w = object_get(js, t, nt, i, "window");
-            if (w >= 0 && !tok_prim_eq(js, &t[w], "null") &&
-                (Window)tok_long(js, &t[w], 0) == window && object_rect(js, t, nt, i, "rect", r)) {
-                ok = true;
-                break;
-            }
-        }
+    for (int i = 0; i < nt; ++i) {
+        if (t[i].type != JT_OBJECT) continue;
+        int wi = object_get(reply.data, t, nt, i, "window");
+        Window candidate = None;
+        if (wi >= 0 && !tok_prim_eq(reply.data, &t[wi], "null") &&
+            tok_window_checked(reply.data, &t[wi], &candidate) && candidate == window &&
+            object_rect(reply.data, t, nt, i, "rect", r)) { ok = true; break; }
     }
+    if (!ok) g_i3_error = I3E_FIELD;
     free(t);
-    free(js);
+    i3_reply_free(&reply);
     return ok;
 }
 
-static bool i3_current_output(XCtx*x,Rect*r){char*ws=i3_request(x,1,"");if(!ws)return false;JTok*t=NULL;int nt=json_parse(ws,strlen(ws),&t);char*name=NULL;if(nt>0)for(int i=0;i<nt;++i)if(t[i].type==JT_OBJECT){int f=object_get(ws,t,nt,i,"focused"),o=object_get(ws,t,nt,i,"output");if(f>=0&&o>=0&&tok_prim_eq(ws,&t[f],"true")){name=tok_string(ws,&t[o]);break;}}free(t);free(ws);if(!name)return false;char*out=i3_request(x,3,"");if(!out){free(name);return false;}nt=json_parse(out,strlen(out),&t);bool ok=false;if(nt>0)for(int i=0;i<nt;++i)if(t[i].type==JT_OBJECT){int n=object_get(out,t,nt,i,"name"),active=object_get(out,t,nt,i,"active");if(n>=0&&active>=0&&tok_eq(out,&t[n],name)&&tok_prim_eq(out,&t[active],"true")&&object_rect(out,t,nt,i,"rect",r)){ok=true;break;}}free(name);free(t);free(out);return ok;}
+/* GET_WORKSPACES already provides the focused workspace rectangle, and the i3
+   IPC specification defines it as equal to the rectangle of its output. A
+   single request avoids races and Unicode name matching entirely. */
+static bool i3_current_output(XCtx *x, Rect *r) {
+    I3Reply reply;
+    if (!i3_request(x, 1, "", &reply)) return false;
+    JTok *t = NULL;
+    int nt = json_parse(reply.data, reply.len, &t);
+    if (nt < 1) { g_i3_error = I3E_JSON; i3_reply_free(&reply); return false; }
+    bool ok = false;
+    for (int i = 0; i < nt; ++i) {
+        if (t[i].type != JT_OBJECT) continue;
+        int fi = object_get(reply.data, t, nt, i, "focused");
+        if (fi >= 0 && tok_prim_eq(reply.data, &t[fi], "true") &&
+            object_rect(reply.data, t, nt, i, "rect", r)) { ok = true; break; }
+    }
+    if (!ok) g_i3_error = I3E_FIELD;
+    free(t);
+    i3_reply_free(&reply);
+    return ok;
+}
 
 /* -------------------------- interactive selection ------------------------ */
 
@@ -1139,41 +1496,41 @@ static bool parse_hex_color(const char *s, uint8_t *r, uint8_t *g, uint8_t *b) {
 }
 
 static void parse_line_style(XCtx *x, const char *spec, SelectStyle *s) {
-    Display *d = x->dpy; Colormap cm = DefaultColormap(d, x->screen);
-    s->width = 2; s->line_style = LineSolid;
-    s->r = s->g = s->b = 255; s->opacity = 128;
-    s->pixel = WhitePixel(d, x->screen);           /* always initialized (M04) */
-    XColor c = {0};
-    if (XAllocNamedColor(d, cm, "white", &c, &c)) s->pixel = c.pixel;
-    char *copy = xstrdup(spec ? spec : ""), *save = NULL;
-    for (char *p = strtok_r(copy, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
-        while (isspace((unsigned char)*p)) ++p;
-        char *eq = strchr(p, '=');
-        if (!eq) { if (*p) die("invalid --line token '%s'", p); continue; }
-        *eq++ = 0;
-        for (char *z = eq - 2; z >= p && isspace((unsigned char)*z); --z) *z = 0; /* trim key */
-        if (!strcmp(p, "width")) {
-            int v; if (!parse_int_strict(eq, 1, 8, &v)) die("--line width must be 1..8");
-            s->width = v;
-        } else if (!strcmp(p, "style")) {
-            if (!strcasecmp(eq, "dash")) s->line_style = LineOnOffDash;
-            else if (!strcasecmp(eq, "solid")) s->line_style = LineSolid;
+    Display *d=x->dpy; Colormap cm=DefaultColormap(d,x->screen);
+    s->width=2; s->line_style=LineSolid; s->r=s->g=s->b=255; s->opacity=128;
+    s->pixel=WhitePixel(d,x->screen);
+    XColor c={0}; if(XAllocNamedColor(d,cm,"white",&c,&c))s->pixel=c.pixel;
+    char *copy=xstrdup(spec?spec:""),*save=NULL;
+    for(char *tok=strtok_r(copy,",",&save);tok;tok=strtok_r(NULL,",",&save)){
+        while(isspace((unsigned char)*tok))++tok;
+        char *end=tok+strlen(tok); while(end>tok&&isspace((unsigned char)end[-1]))*--end=0;
+        if(!*tok)continue;
+        char *eq=strchr(tok,'='); if(!eq)die("invalid --line token '%s'",tok);
+        *eq++=0;
+        char *kend=tok+strlen(tok); while(kend>tok&&isspace((unsigned char)kend[-1]))*--kend=0;
+        while(isspace((unsigned char)*eq))++eq;
+        char *vend=eq+strlen(eq); while(vend>eq&&isspace((unsigned char)vend[-1]))*--vend=0;
+        if(!*tok||!*eq)die("invalid --line token");
+        if(!strcmp(tok,"width")){
+            int v;if(!parse_int_strict(eq,1,8,&v))die("--line width must be 1..8");s->width=v;
+        }else if(!strcmp(tok,"style")){
+            if(!strcasecmp(eq,"dash"))s->line_style=LineOnOffDash;
+            else if(!strcasecmp(eq,"solid"))s->line_style=LineSolid;
             else die("--line style must be 'solid' or 'dash'");
-        } else if (!strcmp(p, "opacity")) {
-            int v; if (!parse_int_strict(eq, 0, 255, &v)) die("--line opacity must be 0..255");
-            s->opacity = (uint8_t)v;
-        } else if (!strcmp(p, "color")) {
-            if (*eq == '"') { eq++; char *z = strrchr(eq, '"'); if (z) *z = 0; }
-            if (parse_hex_color(eq, &s->r, &s->g, &s->b)) {
-                XColor xc = { .red=(unsigned short)(s->r*257), .green=(unsigned short)(s->g*257),
-                              .blue=(unsigned short)(s->b*257), .flags=DoRed|DoGreen|DoBlue };
-                if (XAllocColor(d, cm, &xc)) s->pixel = xc.pixel;
-            } else if (XAllocNamedColor(d, cm, eq, &c, &c)) {
-                s->pixel = c.pixel; s->r=(uint8_t)(c.red/257); s->g=(uint8_t)(c.green/257); s->b=(uint8_t)(c.blue/257);
-            } else die("--line color '%s' is not #RRGGBB or a known color name", eq);
-        } else {
-            die("unknown --line key '%s'", p);
-        }
+        }else if(!strcmp(tok,"opacity")){
+            int v;if(!parse_int_strict(eq,0,255,&v))die("--line opacity must be 0..255");s->opacity=(uint8_t)v;
+        }else if(!strcmp(tok,"color")){
+            if(*eq=='"'){
+                size_t n=strlen(eq);if(n<2||eq[n-1]!='"')die("unterminated quoted --line color");eq[n-1]=0;++eq;
+            }
+            if(parse_hex_color(eq,&s->r,&s->g,&s->b)){
+                XColor xc={.red=(unsigned short)(s->r*257),.green=(unsigned short)(s->g*257),.blue=(unsigned short)(s->b*257),.flags=DoRed|DoGreen|DoBlue};
+                if(!XAllocColor(d,cm,&xc))die("cannot allocate --line color '%s'",eq);
+                s->pixel=xc.pixel;
+            }else if(XAllocNamedColor(d,cm,eq,&c,&c)){
+                s->pixel=c.pixel;s->r=(uint8_t)(c.red/257);s->g=(uint8_t)(c.green/257);s->b=(uint8_t)(c.blue/257);
+            }else die("--line color '%s' is not #RRGGBB or a known color name",eq);
+        }else die("unknown --line key '%s'",tok);
     }
     free(copy);
 }
@@ -1229,19 +1586,32 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
     Display *d = x->dpy;
     *clicked = None;
     if (frozen_image) *frozen_image = NULL;
+    if (!refresh_root_geometry(x)) { warnx("cannot query the X11 root geometry"); return false; }
+    checked_image_bytes(x->root_w, x->root_h, 3, "selection snapshot");
+    uint64_t selection_pixels=(uint64_t)(unsigned)x->root_w*(uint64_t)(unsigned)x->root_h;
+    ensure_work_budget(selection_pixels*8u,"selection snapshot and overlay");
+    const int initial_root_w = x->root_w, initial_root_h = x->root_h;
+    XWindowAttributes root_attr; long old_root_mask=0;
+    if(XGetWindowAttributes(d,x->root,&root_attr)){old_root_mask=root_attr.your_event_mask;XSelectInput(d,x->root,old_root_mask|StructureNotifyMask);}
 
-    /* Pick render mode. SHAPE is required for a transparent live overlay. */
-    int seb = 0, ser = 0;
-    bool shape_ok = x->ext.XShapeQueryExtension && x->ext.XShapeCombineRectangles &&
-                    x->ext.XShapeQueryExtension(d, &seb, &ser);
-    bool use_freeze = freeze || !shape_ok;
+    /* A compositor may animate an overlay after it is destroyed. To guarantee
+       clean pixels, automatically use the snapshot-backed mode whenever an
+       X11 compositor is active. Live mode remains available on uncomposited X11. */
+    bool shape_ok = x->shape_ok && x->root_w <= SHRT_MAX && x->root_h <= SHRT_MAX;
+    bool has_compositor = compositor_active(x);
+    bool use_freeze = freeze || !shape_ok || has_compositor;
 
     XImage *snap = NULL;
     if (use_freeze) {                                /* need a clean snapshot to draw over */
+        xerror_begin(d);
         snap = XGetImage(d, x->root, 0, 0, (unsigned)x->root_w, (unsigned)x->root_h, AllPlanes, ZPixmap);
-        if (!snap) {                                 /* fall back to live if snapshot fails */
-            if (shape_ok) use_freeze = false;
-            else { warnx("cannot snapshot the screen for selection"); return false; }
+        int snap_error=xerror_end(d);
+        if (!snap || snap_error) {
+            if(snap){XDestroyImage(snap);snap=NULL;}
+            /* Never fall back to live under a compositor: that can save fade or
+               shadow remnants. Failing clearly is safer than a corrupted image. */
+            if (shape_ok && !has_compositor && !freeze) use_freeze = false;
+            else { XSelectInput(d,x->root,old_root_mask); warnx("cannot snapshot the screen for selection"); return false; }
         }
     }
 
@@ -1254,15 +1624,18 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
     Window ov = XCreateWindow(d, x->root, 0, 0, (unsigned)x->root_w, (unsigned)x->root_h, 0,
                               CopyFromParent, InputOutput, CopyFromParent,
                               CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &a);
-    if (ov == None) { if (snap) XDestroyImage(snap); warnx("cannot create selection overlay"); return false; }
+    if (ov == None) { if (snap) XDestroyImage(snap); XSelectInput(d,x->root,old_root_mask); warnx("cannot create selection overlay"); return false; }
 
     Pixmap bg = None;
     if (use_freeze) {                                /* back overlay with the snapshot */
+        xerror_begin(d);
         bg = XCreatePixmap(d, x->root, (unsigned)x->root_w, (unsigned)x->root_h,
                            (unsigned)DefaultDepth(d, x->screen));
-        GC pg = XCreateGC(d, bg, 0, NULL);
-        XPutImage(d, bg, pg, snap, 0, 0, 0, 0, (unsigned)x->root_w, (unsigned)x->root_h);
-        XFreeGC(d, pg);
+        GC pg = bg ? XCreateGC(d, bg, 0, NULL) : None;
+        if (bg && pg) XPutImage(d, bg, pg, snap, 0, 0, 0, 0, (unsigned)x->root_w, (unsigned)x->root_h);
+        int resource_error=xerror_end(d);
+        if(pg)XFreeGC(d,pg);
+        if(!bg||resource_error){if(bg)XFreePixmap(d,bg);XDestroyWindow(d,ov);XDestroyImage(snap);XSelectInput(d,x->root,old_root_mask);warnx("cannot create the frozen selection overlay");return false;}
         XSetWindowBackgroundPixmap(d, ov, bg);
     } else {                                         /* start hidden until first drag */
         x->ext.XShapeCombineRectangles(d, ov, I3_SHAPE_BOUNDING, 0, 0, NULL, 0, I3_SHAPE_SET, I3_SHAPE_UNSORTED);
@@ -1301,6 +1674,7 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
         if (bg) XFreePixmap(d, bg);
         XDestroyWindow(d, ov);
         if (snap) XDestroyImage(snap);
+        XSelectInput(d,x->root,old_root_mask);
         warnx("cannot grab the pointer for selection");
         return false;
     }
@@ -1332,6 +1706,11 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
            us even when idle (no more frozen selection on kill). */
         while (!g_interrupted && !cancel && !have && XPending(d) > 0) {
             XEvent e; XNextEvent(d, &e);
+            if (!refresh_root_geometry(x) || x->root_w != initial_root_w || x->root_h != initial_root_h) {
+                warnx("display geometry changed during selection; selection canceled");
+                cancel = true;
+                break;
+            }
             switch (e.type) {
             case ButtonPress:
                 if (e.xbutton.button == Button1) {
@@ -1386,6 +1765,9 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
                 }
                 break;
             }
+            case ConfigureNotify:
+                if(e.xconfigure.window==x->root){warnx("display geometry changed during selection; selection canceled");cancel=true;}
+                break;
             case Expose:
                 if (use_freeze && rect_valid(shown)) /* keep border after a repaint */
                     XDrawRectangle(d, ov, gc, shown.x, shown.y,
@@ -1410,15 +1792,15 @@ static bool interactive_select(XCtx *x, bool freeze, bool ignore_keyboard,
     XDestroyWindow(d, ov);
     if (bg) XFreePixmap(d, bg);
     XSync(d, True);                                  /* apply destroy, drop stale events */
+    XSelectInput(d,x->root,old_root_mask);
 
     bool ok = have && !cancel && !g_interrupted;
     if (ok && use_freeze && frozen_image) {
         *frozen_image = snap;                        /* caller crops from clean snapshot */
     } else {
         if (snap) XDestroyImage(snap);
-        if (ok && !use_freeze) {                     /* let the compositor fully repaint freed strips */
-            XSync(d, False);
-            sleep_seconds(0.12);
+        if (ok && !use_freeze) {
+            /* No compositor is active in live mode, so XSync is sufficient. */
             XSync(d, False);
         }
     }
@@ -1434,9 +1816,7 @@ typedef struct {
     int w,h; size_t bytes;
 } ExpandInfo;
 
-static char *str_replace_vars(const char *in,const ExpandInfo*i,bool shell_quote_values);
-
-static char *shell_quote(const char*s){Buf b={0};buf_u8(&b,'\'');for(;*s;++s){if(*s=='\'')buf_put(&b,"'\\''",4);else buf_u8(&b,(uint8_t)*s);}buf_u8(&b,'\'');buf_u8(&b,0);return(char*)b.p;}
+static char *str_replace_vars(const char *in,const ExpandInfo*i);
 
 /* Replace path separators and control bytes so a filename component (e.g. a
    window title in $W) cannot escape the output directory or inject control
@@ -1445,9 +1825,41 @@ static void sanitize_component(char *s){ if(!s)return; for(;*s;++s){unsigned cha
 /* Keep '/' (directories) but strip control bytes from a full path. */
 static void sanitize_path_controls(char *s){ if(!s)return; for(;*s;++s){unsigned char c=(unsigned char)*s; if(c<0x20||c==0x7f)*s='_';} }
 
-static char *str_replace_vars(const char *in,const ExpandInfo*i,bool quote){Buf b={0};char num[64];for(size_t p=0;in[p];++p){if(in[p]=='$'){char c=in[p+1];const char*v=NULL;switch(c){case'$':buf_u8(&b,'$');p++;continue;case'f':v=i->path;break;case'm':v=i->thumb_path;break;case'n':{const char*q=i->path?strrchr(i->path,'/'):NULL;v=q?q+1:i->path;}break;case'w':snprintf(num,sizeof(num),"%d",i->w);v=num;break;case'h':snprintf(num,sizeof(num),"%d",i->h);v=num;break;case'p':snprintf(num,sizeof(num),"%lld",(long long)i->w*(long long)i->h);v=num;break;case's':snprintf(num,sizeof(num),"%zu",i->bytes);v=num;break;case'F':case't':v=i->fmt;break;case'W':v=i->title;break;case'a':{static char host[256];if(gethostname(host,sizeof(host))<0)strcpy(host,"unknown");host[sizeof(host)-1]=0;v=host;}break;default:buf_u8(&b,'$');continue;}if(v){char*q=quote?shell_quote(v):xstrdup(v);buf_put(&b,q,strlen(q));free(q);p++;continue;}}if(in[p]=='\\'&&in[p+1]=='n'){buf_u8(&b,'\n');p++;}else buf_u8(&b,(uint8_t)in[p]);}buf_u8(&b,0);return(char*)b.p;}
+static char *str_replace_vars(const char *in, const ExpandInfo *i) {
+    Buf b = {0};
+    char num[64];
+    for (size_t p = 0; in[p]; ++p) {
+        if (in[p] == '$') {
+            char c = in[p+1];
+            const char *v = NULL;
+            switch (c) {
+            case '$': buf_u8(&b, '$'); ++p; continue;
+            case 'f': v = i->path; break;
+            case 'm': v = i->thumb_path; break;
+            case 'n': { const char *q = i->path ? strrchr(i->path, '/') : NULL; v = q ? q+1 : i->path; } break;
+            case 'w': snprintf(num,sizeof(num),"%d",i->w); v=num; break;
+            case 'h': snprintf(num,sizeof(num),"%d",i->h); v=num; break;
+            case 'p': snprintf(num,sizeof(num),"%lld",(long long)i->w*(long long)i->h); v=num; break;
+            case 's': snprintf(num,sizeof(num),"%zu",i->bytes); v=num; break;
+            case 'F': case 't': v=i->fmt; break;
+            case 'W': v=i->title; break;
+            case 'a': {
+                static char host[256];
+                if (gethostname(host,sizeof(host)) < 0) strcpy(host,"unknown");
+                host[sizeof(host)-1] = 0; v=host;
+            } break;
+            default: buf_u8(&b,'$'); continue;
+            }
+            if (v) { buf_put(&b,v,strlen(v)); ++p; continue; }
+        }
+        if (in[p] == '\\' && in[p+1] == 'n') { buf_u8(&b,'\n'); ++p; }
+        else buf_u8(&b,(uint8_t)in[p]);
+    }
+    buf_u8(&b,0);
+    return (char*)b.p;
+}
 
-static char *expand_filename(const char *pattern,const ExpandInfo*i){char timebuf[PATH_MAX*2];time_t now=time(NULL);struct tm tm;localtime_r(&now,&tm);size_t k=strftime(timebuf,sizeof(timebuf),pattern,&tm);if(k==0&&pattern[0])die("cannot expand filename pattern (too long or unsupported time format)");if(k==0)timebuf[0]=0;return str_replace_vars(timebuf,i,false);}
+static char *expand_filename(const char *pattern,const ExpandInfo*i){char timebuf[PATH_MAX*2];time_t now=time(NULL);struct tm tm;localtime_r(&now,&tm);size_t k=strftime(timebuf,sizeof(timebuf),pattern,&tm);if(k==0&&pattern[0])die("cannot expand filename pattern (too long or unsupported time format)");if(k==0)timebuf[0]=0;return str_replace_vars(timebuf,i);}
 
 static const char *format_name(Format f){return f==FMT_BMP?"bmp":"png";}
 static Format parse_format(const char*s){if(!s||!*s)return FMT_AUTO;if(!strcasecmp(s,"png"))return FMT_PNG;if(!strcasecmp(s,"bmp"))return FMT_BMP;die("unsupported format '%s' (supported: png, bmp)",s);return FMT_AUTO;}
@@ -1534,7 +1946,64 @@ static bool save_unique(char **path_io, const uint8_t *data, size_t n, bool over
     return false;
 }
 
-static int run_post_command(const char*cmd,const ExpandInfo*i){char*expanded=str_replace_vars(cmd,i,true);pid_t pid=fork();if(pid<0){free(expanded);return -1;}if(pid==0){execl("/bin/sh","sh","-c",expanded,(char*)NULL);_exit(127);}free(expanded);int st=0;pid_t r;while((r=waitpid(pid,&st,0))<0&&errno==EINTR){}if(r!=pid)return -1;return WIFEXITED(st)?WEXITSTATUS(st):128;}
+static void child_setenv(const char *name, const char *value) {
+    if (setenv(name, value ? value : "", 1) < 0) _exit(126);
+}
+
+/* Post commands receive ordinary shell environment variables. This makes the
+   natural and safe form `"$f"` work correctly and avoids rewriting shell text. */
+static int run_post_command(const char *cmd, const ExpandInfo *i) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = SIG_DFL; sigemptyset(&sa.sa_mask);
+        sigaction(SIGPIPE, &sa, NULL); sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL); sigaction(SIGQUIT, &sa, NULL); sigaction(SIGCHLD, &sa, NULL);
+        sigset_t empty_mask; sigemptyset(&empty_mask); (void)sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+        char num[64], host[256];
+        const char *base = i->path ? strrchr(i->path, '/') : NULL; base = base ? base + 1 : (i->path ? i->path : "");
+        if (gethostname(host, sizeof(host)) < 0) strcpy(host, "unknown");
+        host[sizeof(host)-1] = 0;
+        child_setenv("f", i->path); child_setenv("m", i->thumb_path); child_setenv("n", base);
+        snprintf(num,sizeof(num),"%d",i->w); child_setenv("w",num);
+        snprintf(num,sizeof(num),"%d",i->h); child_setenv("h",num);
+        snprintf(num,sizeof(num),"%lld",(long long)i->w*(long long)i->h); child_setenv("p",num);
+        snprintf(num,sizeof(num),"%zu",i->bytes); child_setenv("s",num);
+        child_setenv("F",i->fmt); child_setenv("t",i->fmt); child_setenv("W",i->title); child_setenv("a",host);
+        child_setenv("I3SHOT_FILE",i->path); child_setenv("I3SHOT_THUMB",i->thumb_path);
+        child_setenv("I3SHOT_TITLE",i->title); child_setenv("I3SHOT_FORMAT",i->fmt);
+        execl("/bin/sh","sh","-c",cmd,(char*)NULL);
+        _exit(127);
+    }
+    (void)setpgid(pid, pid);
+    int st = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) return -1;
+        if (g_interrupted) {
+            int sig = g_signal ? (int)g_signal : SIGTERM;
+            (void)kill(-pid, sig);
+            int64_t deadline = now_ms() + 2000;
+            while (now_ms() < deadline) {
+                r = waitpid(pid, &st, WNOHANG);
+                if (r == pid) return 128 + sig;
+                if (r < 0 && errno != EINTR) return 128 + sig;
+                struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL);
+            }
+            (void)kill(-pid, SIGKILL);
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            return 128 + sig;
+        }
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+    }
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return 128;
+}
+
 
 /* -------------------------------- options --------------------------------- */
 
@@ -1591,7 +2060,8 @@ static void usage(FILE*f){fprintf(f,
 "  -v, --version            Version\n"
 "  -h, --help               Help\n\n"
 "Selection OPTS: capture | hole | hide[,#RRGGBB] | blur[,1..30]\n"
-"Filename/command variables: strftime %% sequences; $$ $a $F $f $h $m $n $p $s $t $w $W\n\n"
+"Filename variables: strftime %% sequences; $$ $a $F $f $h $m $n $p $s $t $w $W\n"
+"Post-command environment: $f $m $n $w $h $p $s $F $t $W $a (quote paths as \"$f\")\n\n"
 "Build: cc -O2 -std=c11 -Wall -Wextra -Wpedantic i3shot.c -o i3shot -lX11 -ldl -lm\n",I3SHOT_VERSION);}
 
 static Rect parse_rect_arg(const char*s){
@@ -1647,7 +2117,7 @@ static Options parse_options(int argc,char**argv){Options o={0};o.target=T_FULL;
         case 'd': {
             const char *s = optarg;
             if (*s == 'b') { o.delay_before_select = true; s++; }
-            double v; if (!parse_double_strict(s, &v) || v < 0) die("invalid delay '%s'", optarg);
+            double v; if (!parse_double_strict(s, &v)) die("invalid delay '%s' (allowed range: 0..86400 seconds)", optarg);
             o.delay = v;
         } break;
         case 'e': free(o.exec_cmd); o.exec_cmd = xstrdup(optarg); break;
@@ -1725,24 +2195,47 @@ static Image join_monitors(XCtx*x,Rect*mons,int n,Rect*logical){
 
 static char *window_title_for_target(XCtx*x,Window w){if(w==None||w==x->root)return xstrdup("");return get_text_property_utf8(x->dpy,w,"_NET_WM_NAME");}
 
-int main(int argc,char**argv){install_signals();XSetErrorHandler(xerror_handler);Options o=parse_options(argc,argv);Format forced=parse_format(o.format_str);Display*d=XOpenDisplay(o.display);if(!d)die("cannot open X display '%s'",o.display?o.display:(getenv("DISPLAY")?getenv("DISPLAY"):"(unset)"));XCtx x={0};x.dpy=d;x.screen=DefaultScreen(d);x.root=RootWindow(d,x.screen);x.root_w=DisplayWidth(d,x.screen);x.root_h=DisplayHeight(d,x.screen);xext_load(&x.ext);
-    SelectStyle ss;parse_line_style(&x,o.line_style,&ss);Rect cap={0,0,x.root_w,x.root_h};Window target_win=None;char*title=NULL;Image image={0};bool image_ready=false;XImage*frozen=NULL;
-    /* Delay ordering: with the 'b' prefix the delay runs before selection. For
-       every non-selection target the normal delay must elapse BEFORE we resolve
-       and capture, so focus/workspace/window changes are honored (C13). */
-    if(o.delay_before_select)countdown(&o);
-    else if(o.target!=T_SELECT)countdown(&o);
-    if(g_interrupted){options_free(&o);XCloseDisplay(d);xext_close(&x.ext);return 130;}
-    switch(o.target){
-    case T_FULL:break;
-    case T_AREA:cap=o.area;break;
+int main(int argc, char **argv) {
+    install_signals();
+    XSetErrorHandler(xerror_handler);
+    Options o = parse_options(argc, argv);
+    Format forced = parse_format(o.format_str);
+    Display *d = XOpenDisplay(o.display);
+    if (!d) die("cannot open X display '%s'", o.display ? o.display : (getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)"));
+
+    XCtx x = {0};
+    x.dpy = d; x.screen = DefaultScreen(d); x.root = RootWindow(d, x.screen); x.display_explicit = o.display != NULL;
+    if (!refresh_root_geometry(&x)) die("cannot query the X11 root window");
+    xext_load(&x.ext);
+    xext_probe(&x);
+
+    SelectStyle ss;
+    parse_line_style(&x, o.line_style, &ss);
+    Rect cap = {0,0,x.root_w,x.root_h};
+    Window target_win = None;
+    char *title = NULL;
+    Image image = {0};
+    bool image_ready = false;
+    XImage *frozen = NULL;
+
+    if (o.delay_before_select) countdown(&o);
+    else if (o.target != T_SELECT) countdown(&o);
+    if (g_interrupted) { options_free(&o); XCloseDisplay(d); xext_close(&x.ext); return 128 + (g_signal ? g_signal : SIGINT); }
+    if (!refresh_root_geometry(&x)) die("cannot refresh the X11 root geometry");
+    cap = (Rect){0,0,x.root_w,x.root_h};
+
+    switch (o.target) {
+    case T_FULL:
+        break;
+    case T_AREA:
+        cap = o.area;
+        break;
     case T_FOCUSED:
         target_win = get_active_window(&x);
-        if (target_win == None || target_win == PointerRoot) die("no focused X11 window");
+        if (target_win == None) die("no focused X11 window");
         if (o.composite && !o.border) {
             image = capture_window_content(&x, target_win, true);
-            image_ready = true;
-            cap = (Rect){0, 0, image.w, image.h};
+            image_ready = true; cap = (Rect){0,0,image.w,image.h};
         } else if (!(o.border && i3_window_rect(&x, target_win, &cap)) &&
                    !window_absolute_rect(&x, target_win, o.border, &cap)) {
             die("cannot determine focused window geometry");
@@ -1750,141 +2243,161 @@ int main(int argc,char**argv){install_signals();XSetErrorHandler(xerror_handler)
         break;
     case T_WINDOW:
         target_win = o.window;
+        if (!window_is_capture_candidate(&x, target_win)) die("window 0x%lx is not a mapped captureable window", target_win);
         if (o.composite && !o.border) {
             image = capture_window_content(&x, target_win, true);
-            image_ready = true;
-            cap = (Rect){0, 0, image.w, image.h};
+            image_ready = true; cap = (Rect){0,0,image.w,image.h};
         } else if (!(o.border && i3_window_rect(&x, target_win, &cap)) &&
                    !window_absolute_rect(&x, target_win, o.border, &cap)) {
             die("cannot determine window geometry");
         }
         break;
-    case T_MONITOR:{if(!x.ext.XRRGetMonitors)warnx("XRandR unavailable; monitor geometry may be the whole screen");int n=0;Rect*m=get_monitors(&x,&n);if(o.monitor<0||o.monitor>=n){free(m);die("monitor %d does not exist; available range is 0..%d",o.monitor,n-1);}cap=m[o.monitor];free(m);break;}
-    case T_MULTI:{int n=0;Rect*m=get_monitors(&x,&n);image=join_monitors(&x,m,n,&cap);image_ready=true;free(m);break;}
-    case T_STACK:image=capture_stack_under_pointer(&x,o.stack_vertical,o.class_name,true,&cap);image_ready=true;break;
-    case T_I3_CONTAINER:if(!i3_tree_target(&x,"container",&cap,&target_win,&title))die("cannot obtain focused container from i3 IPC");break;
-    case T_I3_WORKSPACE:if(!i3_tree_target(&x,"workspace",&cap,NULL,&title))die("cannot obtain focused workspace from i3 IPC");break;
-    case T_I3_OUTPUT:if(!i3_current_output(&x,&cap))die("cannot obtain current output from i3 IPC");break;
-    case T_SELECT:{Window clicked=None;if(!interactive_select(&x,o.freeze,o.ignore_keyboard,&ss,&cap,&clicked,&frozen)){options_free(&o);XCloseDisplay(d);xext_close(&x.ext);return 1;}target_win=clicked;if(clicked!=None&&o.border){if(!i3_window_rect(&x,clicked,&cap))window_absolute_rect(&x,clicked,true,&cap);}break;}
+    case T_MONITOR: {
+        if (!x.randr_ok) die("XRandR 1.5 monitor discovery is unavailable; refusing to guess monitor geometry");
+        int n = 0; Rect *m = get_monitors(&x, &n);
+        if (!m || n <= 0) die("cannot obtain monitor geometry from XRandR");
+        if (o.monitor < 0 || o.monitor >= n) { free(m); die("monitor %d does not exist; available range is 0..%d",o.monitor,n-1); }
+        cap = m[o.monitor]; free(m); break;
     }
-    if (!o.delay_before_select && o.target == T_SELECT) countdown(&o);  /* preserve chosen rect */
-    if (g_interrupted) {
-        if (frozen) XDestroyImage(frozen);
-        options_free(&o);
-        XCloseDisplay(d);
-        xext_close(&x.ext);
-        return 130;
+    case T_MULTI: {
+        if (!x.randr_ok) die("XRandR 1.5 monitor discovery is unavailable; cannot capture multiple monitors");
+        int n = 0; Rect *m = get_monitors(&x, &n);
+        if (!m || n <= 0) die("cannot obtain monitor geometry from XRandR");
+        image = join_monitors(&x,m,n,&cap); image_ready = true; free(m); break;
+    }
+    case T_STACK:
+        image = capture_stack_under_pointer(&x,o.stack_vertical,o.class_name,true,&cap); image_ready = true; break;
+    case T_I3_CONTAINER:
+        if (!i3_tree_target(&x,"container",&cap,&target_win,&title)) die("cannot obtain focused container from i3 IPC: %s",i3_error_text());
+        break;
+    case T_I3_WORKSPACE:
+        if (!i3_tree_target(&x,"workspace",&cap,NULL,&title)) die("cannot obtain focused workspace from i3 IPC: %s",i3_error_text());
+        break;
+    case T_I3_OUTPUT:
+        if (!i3_current_output(&x,&cap)) die("cannot obtain current output from i3 IPC: %s",i3_error_text());
+        break;
+    case T_SELECT: {
+        Window clicked = None;
+        if (!interactive_select(&x,o.freeze,o.ignore_keyboard,&ss,&cap,&clicked,&frozen)) {
+            int rc = g_interrupted ? 128 + (g_signal ? g_signal : SIGINT) : 1;
+            options_free(&o); XCloseDisplay(d); xext_close(&x.ext); return rc;
+        }
+        target_win = clicked;
+        if (clicked != None && o.border && !i3_window_rect(&x,clicked,&cap) &&
+            !window_absolute_rect(&x,clicked,true,&cap)) die("cannot determine selected window border geometry");
+        break;
+    }
     }
 
-    Rect root_bounds = {0, 0, x.root_w, x.root_h};
-    Rect selected_rect = cap;
-    Rect cursor_rect = cap;
+    if (!o.delay_before_select && o.target == T_SELECT) countdown(&o);
+    if (g_interrupted) {
+        if (frozen) XDestroyImage(frozen);
+        options_free(&o); XCloseDisplay(d); xext_close(&x.ext);
+        return 128 + (g_signal ? g_signal : SIGINT);
+    }
+
+    Rect root_bounds;
+    if (frozen) root_bounds = (Rect){0,0,frozen->width,frozen->height};
+    else {
+        if (!refresh_root_geometry(&x)) die("cannot refresh the X11 root geometry before capture");
+        root_bounds = (Rect){0,0,x.root_w,x.root_h};
+    }
+    Rect selected_rect = cap, cursor_rect = cap;
     bool cursor_has_root_mapping = false;
 
     if (o.target == T_SELECT && o.select_mode != SM_CAPTURE) {
-        selected_rect = rect_intersect(selected_rect, root_bounds);
+        selected_rect = rect_intersect(selected_rect,root_bounds);
         if (!rect_valid(selected_rect)) die("selected rectangle is empty after clipping");
-        if (frozen) {
-            image = ximage_to_rgb(frozen, root_bounds);
-            XDestroyImage(frozen);
-            frozen = NULL;
-        } else {
-            image = capture_root(&x, root_bounds);
-        }
-        image_ready = true;
-        cap = root_bounds;
-        cursor_rect = root_bounds;
-        cursor_has_root_mapping = true;
+        if (frozen) { image=ximage_to_rgb(&x,frozen,root_bounds); XDestroyImage(frozen); frozen=NULL; }
+        else image=capture_root(&x,root_bounds);
+        cap=root_bounds; cursor_rect=root_bounds; cursor_has_root_mapping=true;
     } else if (!image_ready) {
-        cap = rect_intersect(cap, root_bounds);
+        cap=rect_intersect(cap,root_bounds);
         if (!rect_valid(cap)) die("capture rectangle is empty after clipping");
-        if (frozen) {
-            image = ximage_to_rgb(frozen, cap);
-            XDestroyImage(frozen);
-            frozen = NULL;
-        } else {
-            image = capture_root(&x, cap);
-        }
-        image_ready = true;
-        cursor_rect = cap;
-        cursor_has_root_mapping = true;
-    } else if (o.composite && (o.target == T_WINDOW || o.target == T_FOCUSED)) {
-        Rect wr;
-        if (window_absolute_rect(&x, target_win, false, &wr)) {
-            cursor_rect = wr;
-            cursor_has_root_mapping = (wr.w == image.w && wr.h == image.h);
-        }
+        if (frozen) { image=ximage_to_rgb(&x,frozen,cap); XDestroyImage(frozen); frozen=NULL; }
+        else image=capture_root(&x,cap);
+        cursor_rect=cap; cursor_has_root_mapping=true;
+    } else if (o.composite && (o.target==T_WINDOW || o.target==T_FOCUSED)) {
+        Rect wr; if (window_absolute_rect(&x,target_win,false,&wr)) { cursor_rect=wr; cursor_has_root_mapping=(wr.w==image.w&&wr.h==image.h); }
     }
 
     if (o.pointer) {
-        if (cursor_has_root_mapping) compose_cursor(&x, &image, cursor_rect);
+        if (cursor_has_root_mapping) compose_cursor(&x,&image,cursor_rect);
         else warnx("cursor capture is unavailable for this joined target");
     }
 
-    if (o.target == T_SELECT && o.select_mode != SM_CAPTURE) {
-        Rect local = selected_rect;
-        if (o.select_mode == SM_HOLE) {
-            image_fill_rect(&image, (Rect){0, 0, image.w, local.y}, ss.r, ss.g, ss.b, ss.opacity);
-            image_fill_rect(&image, (Rect){0, local.y + local.h, image.w, image.h - (local.y + local.h)}, ss.r, ss.g, ss.b, ss.opacity);
-            image_fill_rect(&image, (Rect){0, local.y, local.x, local.h}, ss.r, ss.g, ss.b, ss.opacity);
-            image_fill_rect(&image, (Rect){local.x + local.w, local.y, image.w - (local.x + local.w), local.h}, ss.r, ss.g, ss.b, ss.opacity);
-        } else if (o.select_mode == SM_HIDE) {
-            image_fill_rect(&image, local, o.hide_r, o.hide_g, o.hide_b, o.hide_alpha); /* 255 = opaque */
-        } else if (o.select_mode == SM_BLUR) {
-            image_blur_rect(&image, local, o.blur_amount);
-        }
+    if (o.target==T_SELECT && o.select_mode!=SM_CAPTURE) {
+        Rect local=selected_rect;
+        if (o.select_mode==SM_HOLE) {
+            image_fill_rect(&image,(Rect){0,0,image.w,local.y},ss.r,ss.g,ss.b,ss.opacity);
+            image_fill_rect(&image,(Rect){0,local.y+local.h,image.w,image.h-(local.y+local.h)},ss.r,ss.g,ss.b,ss.opacity);
+            image_fill_rect(&image,(Rect){0,local.y,local.x,local.h},ss.r,ss.g,ss.b,ss.opacity);
+            image_fill_rect(&image,(Rect){local.x+local.w,local.y,image.w-(local.x+local.w),local.h},ss.r,ss.g,ss.b,ss.opacity);
+        } else if (o.select_mode==SM_HIDE) image_fill_rect(&image,local,o.hide_r,o.hide_g,o.hide_b,o.hide_alpha);
+        else if (o.select_mode==SM_BLUR) image_blur_rect(&image,local,o.blur_amount);
     }
-    if (!title) title = window_title_for_target(&x, target_win);
-    sanitize_component(title);                       /* $W cannot inject '/' or controls (H35) */
 
-    Format prov = forced == FMT_AUTO ? format_from_path(o.filename) : forced;
-    ExpandInfo ei = { .title = title, .w = image.w, .h = image.h, .fmt = format_name(prov) };
-    char *path = expand_filename(o.filename, &ei);
-    sanitize_path_controls(path);                    /* no newlines/controls in filenames (H36) */
+    int thumb_w = 0, thumb_h = 0;
+    if (o.thumb && strcmp(o.filename, "-")) {
+        int64_t tw=o.thumb_w, th=o.thumb_h;
+        if (o.thumb_percent) { tw=MAX2(INT64_C(1),(int64_t)image.w*o.thumb_percent/100); th=MAX2(INT64_C(1),(int64_t)image.h*o.thumb_percent/100); }
+        else if (tw==0) tw=MAX2(INT64_C(1),(int64_t)llrint((double)th*image.w/image.h));
+        else if (th==0) th=MAX2(INT64_C(1),(int64_t)llrint((double)tw*image.h/image.w));
+        if (tw>INT_MAX||th>INT_MAX) die("thumbnail dimensions are too large");
+        checked_image_bytes((int)tw,(int)th,3,"thumbnail");
+        thumb_w=(int)tw; thumb_h=(int)th;
+    }
 
-    Format fmt = forced == FMT_AUTO ? format_from_path(path) : forced;   /* decide from final path (H34) */
-    ei.fmt = format_name(fmt);
-    if (strcmp(path, "-")) {                          /* warn on extension/format mismatch (H33, M27) */
-        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
-        const char *ext = strrchr(base, '.');
-        if (forced == FMT_AUTO) {
-            if (ext && strcasecmp(ext, ".png") && strcasecmp(ext, ".bmp") && strcasecmp(ext, ".dib"))
-                warnx("unknown extension '%s'; writing %s data", ext, format_name(fmt));
+    if (!title) title=window_title_for_target(&x,target_win);
+    sanitize_component(title);
+    Format prov=forced==FMT_AUTO?format_from_path(o.filename):forced;
+    ExpandInfo ei={.title=title,.w=image.w,.h=image.h,.fmt=format_name(prov)};
+    char *path=expand_filename(o.filename,&ei);
+    sanitize_path_controls(path);
+    Format fmt=forced==FMT_AUTO?format_from_path(path):forced;
+    ei.fmt=format_name(fmt);
+
+    if (strcmp(path,"-")) {
+        const char *base=strrchr(path,'/'); base=base?base+1:path; const char *ext=strrchr(base,'.');
+        if (forced==FMT_AUTO) {
+            if (ext&&strcasecmp(ext,".png")&&strcasecmp(ext,".bmp")&&strcasecmp(ext,".dib")) warnx("unknown extension '%s'; writing %s data",ext,format_name(fmt));
         } else {
-            bool ext_bmp = ext && (!strcasecmp(ext, ".bmp") || !strcasecmp(ext, ".dib"));
-            bool ext_png = ext && !strcasecmp(ext, ".png");
-            if ((fmt == FMT_BMP && ext_png) || (fmt == FMT_PNG && ext_bmp))
-                warnx("--format %s does not match extension '%s'", format_name(fmt), ext);
+            bool ext_bmp=ext&&(!strcasecmp(ext,".bmp")||!strcasecmp(ext,".dib")); bool ext_png=ext&&!strcasecmp(ext,".png");
+            if ((fmt==FMT_BMP&&ext_png)||(fmt==FMT_PNG&&ext_bmp)) warnx("--format %s does not match extension '%s'",format_name(fmt),ext);
         }
     }
 
-    Buf encoded = fmt == FMT_BMP ? encode_bmp(&image) : encode_png(&image, o.compression);
-    ei.bytes = encoded.n;
-    if (!save_unique(&path, encoded.p, encoded.n, o.overwrite, 0600)) { int e = errno; buf_free(&encoded); die("cannot save '%s': %s", path, strerror(e)); }
-    buf_free(&encoded);
-    ei.path = path;
-    char *tpath = o.thumb ? thumbnail_path(path) : NULL;
-    ei.thumb_path = tpath ? tpath : "";
+    Buf encoded=fmt==FMT_BMP?encode_bmp(&image):encode_png(&image,o.compression);
+    ei.bytes=encoded.n;
+    if (!save_unique(&path,encoded.p,encoded.n,o.overwrite,0600)) { int e=errno; buf_free(&encoded); die("cannot save '%s': %s",path,strerror(e)); }
+    buf_free(&encoded); ei.path=path;
+
+    char *tpath=o.thumb?thumbnail_path(path):NULL; ei.thumb_path=tpath?tpath:"";
     if (o.thumb) {
-        if (!strcmp(path, "-")) warnx("thumbnail skipped because main output is stdout");
+        if (!strcmp(path,"-")) warnx("thumbnail skipped because main output is stdout");
         else {
-            int tw = o.thumb_w, th = o.thumb_h;
-            if (o.thumb_percent) { tw = MAX2(1, image.w * o.thumb_percent / 100); th = MAX2(1, image.h * o.thumb_percent / 100); }
-            else if (tw == 0) tw = MAX2(1, (int)lrint((double)th * image.w / image.h));
-            else if (th == 0) th = MAX2(1, (int)lrint((double)tw * image.h / image.w));
-            Image thumb = image_scale_bilinear(&image, tw, th);
-            Format tf = forced == FMT_AUTO ? format_from_path(tpath) : forced;
-            Buf tb = tf == FMT_BMP ? encode_bmp(&thumb) : encode_png(&thumb, o.compression);
-            /* Best-effort: a thumbnail failure must not discard the saved image (H38). */
-            if (!save_bytes_atomic(tpath, tb.p, tb.n, o.overwrite, 0600)) warnx("cannot save thumbnail '%s': %s", tpath, strerror(errno));
+            Image thumb=image_scale_bilinear(&image,thumb_w,thumb_h);
+            Format tf=forced==FMT_AUTO?format_from_path(tpath):forced;
+            Buf tb=tf==FMT_BMP?encode_bmp(&thumb):encode_png(&thumb,o.compression);
+            if (!save_bytes_atomic(tpath,tb.p,tb.n,o.overwrite,0600)) warnx("cannot save thumbnail '%s': %s",tpath,strerror(errno));
             buf_free(&tb); image_free(&thumb);
         }
     }
-    struct stat st; if (strcmp(path, "-") && stat(path, &st) == 0) ei.bytes = (size_t)st.st_size;
-    if (o.exec_cmd && strcmp(path, "-")) { int rc = run_post_command(o.exec_cmd, &ei); if (rc != 0) warnx("post command exited with status %d", rc); }
-    if (!o.silent && strcmp(path, "-")) {
-        fprintf(stderr, "Saved %s (%dx%d, %zu bytes)\n", path, image.w, image.h, ei.bytes);
-        if (isatty(STDERR_FILENO)) fputc('\a', stderr);   /* bell only on a real terminal (L06) */
+
+    struct stat st; if (strcmp(path,"-")&&stat(path,&st)==0) ei.bytes=(size_t)st.st_size;
+    int final_rc=0;
+    if (o.exec_cmd&&strcmp(path,"-")) {
+        int rc=run_post_command(o.exec_cmd,&ei);
+        if (g_interrupted) final_rc=128+(g_signal?g_signal:SIGTERM);
+        else if (rc!=0) warnx("post command exited with status %d",rc);
     }
-    free(tpath); free(path); free(title); image_free(&image); options_free(&o); XCloseDisplay(d); xext_close(&x.ext); return 0;
+    if (!final_rc && !o.silent&&strcmp(path,"-")) {
+        fprintf(stderr,"Saved %s (%dx%d, %zu bytes)\n",path,image.w,image.h,ei.bytes);
+        if (isatty(STDERR_FILENO)) fputc('\a',stderr);
+    }
+
+    free(tpath); free(path); free(title); image_free(&image); options_free(&o);
+    XCloseDisplay(d); xext_close(&x.ext);
+    close(g_sigpipe[0]); close(g_sigpipe[1]);
+    return final_rc;
 }
